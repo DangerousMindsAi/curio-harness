@@ -6,153 +6,99 @@ The loop is a single driver class, `ReactLoopAgent`, that drains a durable two-l
 
 ## Pseudo-code
 
+The loop has three levels. A **turn** answers one piece of user input and ends when the model stops asking for tools. A turn is a series of **steps**; each step is one model call plus the tools that call asks for. A step may need several **attempts** if the model call fails and a plugin asks for a retry. Every message the model sees is first written to the session log, and each request is rebuilt from that log. Lines marked `[event]` are where plugins can intervene (the tables below list which plugins do), and lines marked `[config]` are settings.
+
 ```text
-# ---- inbox (agent.ts:154-181, inbox.ts:109-243) ----
-followup(msg): send(msg, 'next-turn', wake=true)     # a queued turn
-steer(msg):    send(msg, 'next-step', wake=true)     # nearest step boundary
-inject(msg):   send(msg, 'next-step', wake=false)    # waits for a waking message
-send(msg, target, wake):
-    if wake and activity already aborted: target = 'next-turn'
-    inbox.splice(target, end, 0, [msg])               # log: agent/inbox/spliced
-                                                      # event: agent/inbox/inserted (emit)
-    if wake: wakeDriver()     # idle -> phase 'running' (emit: agent/status), start kick()
-                              # maintenance or aborted -> latch wakeRequested, replay at idle
-cancel(cause, keepInbox?): clear inbox unless keepInbox; abort(cause)
+# ---------- Sending a message ----------
+the agent has an inbox with two lists:
+    next-turn: messages that start a new turn         (followup)
+    next-step: messages for the very next model call  (steer, inject)
 
-kick(): while turn(): pass                # runs until the inbox is empty; errors contained
+when someone sends a message:
+    save it in the inbox and the session log
+    if the agent is idle, start working through the inbox
 
-# ---- turn (agent.ts:298-398) ----
-turn():
-    append turn/start {turn}                                  # log: turn/start
-    turnEnds = null; target = 'next-turn'
+while the inbox has anything in it:
+    run_turn()
+
+# ---------- A turn ----------
+run_turn():
+    log "turn started"
+    take the next waiting message
     loop:
-        decision = preStep(target)
-        if decision.reject: turnEnds = blocked; break
-        if turnEnds and decision.messages empty: break
-        if first step and decision.messages empty: turnEnds = completed; break   # no model call
-        append step/start                                     # log: step/start
-        recovery = ToolCallRecovery observing session/event
-        try:   stepEnd = step(decision)
-               if turnEnds is not max-tokens: turnEnds = stepEnd   # max-tokens is sticky
-        except: append synthetic tool/result for owed calls  # log: tool/result
-                raise
-        finally: append step/end                              # log: step/end
-        if turnEnds and inbox.nextStep empty:
-            await serial agent/turn-stopping {turn, signal}   # serial: listeners may steer()
-        if turnEnds and inbox.nextStep empty: break
-        target = 'next-step'
-    on abort:  turnEnds = aborted{cause: user|parent|hook|disposed}
-    on error:  turnEnds = error{LlmFailure | {UNKNOWN, errorChain}}; emit agent/error
-    finally:   append turn/end {turn, reason: turnEnds}       # log: turn/end
-    return inbox.hasPending                                   # another turn if input is queued
+        let plugins inspect the step before it starts:            [event] agent/pre-step
+            they can block it (the turn ends as "blocked"),
+            or add context (instructions, the time, skills, plan mode notes),
+            or compact the history first
+        outcome = run_step()
+        if the model is still owed something (it called tools):  continue
+        if nothing new is waiting for the next step:
+            let plugins decide whether to keep going             [event] agent/turn-stopping
+                (a plugin keeps going by putting a message in next-step)
+        if still nothing is waiting: stop
+        take the waiting next-step messages and loop
+    log "turn ended" with the reason:
+        completed, hit max tokens, blocked, aborted, or error
 
-preStep(target):                                              # agent.ts:267-288
-    claimed = inbox.claim(target)     # all next-step, plus ONE next-turn msg if target is next-turn
-                                      # log: agent/inbox/spliced; emit: agent/inbox/claimed
-    assembly = systemPrompt.assemble()                        # waterfall: system-prompt/assemble
-    return waterfall agent/pre-step {messages: claimed, turn, step, signal}
-        default (innermost): enter(claimed + runtime-context snapshot if changed)
-        # listeners: reject | enter(messages', startsRequestSeries?)
+# ---------- A step ----------
+run_step():
+    loop:                                         # repeats only when a plugin asks for a retry
+        let plugins choose the provider, model and effort         [event] agent/request
+        log the system prompt and any new user messages
+        log any change to the tool list as a message (so the cached prefix stays valid)
+        build the request from the session log
+        stream the reply, showing it live
 
-# ---- step (agent.ts:400-561) ----
-step(decision):
-    firstAttempt = true
-    loop:                                                     # one iteration per request attempt
-        config = waterfall agent/request {turn, step, signal} # seed: AgentOptions, then logged header
-        prepared = llm.prepareCall(config)                    # service: ctx.llm; NO_ADAPTER tolerated
-        context = refresh runtime-context sections
-        for commit in SystemPromptProjection.project(prompt, inHistory=prepared.systemPromptUpdate,
-                                                     startsSeries=...):
-            append system/message (append or replace)         # log: system/message
-        if firstAttempt: append each decision message         # log: user/message
-        append runtime-context snapshot if not yet admitted   # log: user/message
-        firstAttempt = false
-        request = buildRequest():                             # agent.ts:616-704
-            append request/header {initial|resume|change|series} when needed   # log: request/header
-            append developer/message {tool-addition|tool-removal} on tool delta # log: developer/message
-            append request/context when provider/model/window changed          # log: request/context
-            messages = deepFreeze(session.deriveMessages())   # model input = projection of the log
-        stream = prepared.stream(request)                     # waterfall: llm/stream (inside ctx.llm)
-        emit agent/assistant-stream start; for chunk: emit chunk   # emit, process-local only
-        if stream throws (after start):
-            append assistant/message{interrupted} if aborted with content,
-            else assistant/attempt                            # log: assistant/attempt
-            raise
-        if finish is error or aborted:
-            append assistant/attempt                          # log: assistant/attempt
-            action = waterfall agent/request-error {failure, retryPolicy, signal}
-            if action is retry: continue                      # re-runs agent/request, NOT pre-step
-            raise LlmError(failure)
-        append assistant/message {message, usage, stream}     # log: assistant/message
-        if finish is max-tokens: return max-tokens            # tool calls are NOT dispatched
-        if no tool-call blocks: return completed
-        concluded = executeToolCalls(calls, acceptContext = inbox.splice('next-step', ...))
-        return completed if concluded else null               # null = model owes another step
+        if the call failed:
+            log the failed attempt
+            ask plugins what to do                               [event] agent/request-error
+                retry plugin: wait and retry on rate limits and server errors
+                compaction plugin: on "context too long", summarize the history and retry
+            if no plugin asked for a retry: fail the turn
+            otherwise try again
 
-# ---- tool dispatch (tool-calls.ts:60-243) ----
-executeToolCalls(calls):
-    while calls remain:
-        mode = tools.executionMode(first)   # isConcurrencySafe(args) === true -> parallel, else exclusive
-        group = parallel ? rest of calls : [first]            # exclusive call = barrier of one
-        runGroup(group)
-        if aborted: for each unstarted call:
-            append tool/call + tool/result ABORTED_BEFORE_DISPATCH   # log: tool/call, tool/result
-runGroup(group):
-    max = agentLoop.config.maxParallelToolCalls.get()         # config: maxParallelToolCalls (volatile)
-    fillPool: while not aborted and inFlight < max:
-        if next call now classifies exclusive: stop filling   # re-classified before each start
-        append tool/call                                      # log: tool/call
-        prepared = await scheduler.prepare(exec)              # pre-execute stage, in model order
-        if prepared is dispatch: inFlight += scheduler.dispatch(exec)   # bodies overlap
-        commitReady()
-    while inFlight: await first settled; commitReady(); refill
-    commitReady(): for contiguous settled slots in model order:
-        result = finalize (post-execute stage) or finish
-        append tool/result {sourceEventSeqs:[tool/call seq]} # log: tool/result
-        for ctx in result.additionalContexts: inbox.splice('next-step')  # log: agent/inbox/spliced
-        concluded |= result.concludesTurn
-    on scheduler failure: drain started calls, raise (turn records recovery results)
+        log the model's reply
+        if the reply hit the output token limit: end the turn (its tool calls are not run)
+        if the reply has no tool calls: the step is done and the model is owed nothing
+        run_tools(tool calls)
+        the model is owed another step, unless a tool said "end the turn here"
 
-# ---- per-call pipeline (packages/core/tools/src/index.ts:1499-1910) ----
-prepare(exec):
-    snapshot + freeze arguments; ptc-mode collapse denies model-direct non-run_code names
-    if caller aborted: return ABORTED_BEFORE_DISPATCH
-    d = waterfall tools/pre-execute (exec)                    # default allow; allow|deny|cancel|ask
-    if d is ask: d = approval.request(...)                    # service: ctx.approval; absent -> deny
-                                                              # log (by approval plugin): approval/asked, approval/decided
-    if d is cancel: return post-result ABORTED_BEFORE_DISPATCH
-    reason = d is allow ? first guard denial : d.reason       # tools.guard(): monotonic, deny-only
-    if reason: return post-result {isError, "Error: <reason>"}   # still flows through post-execute
-    return dispatch
-dispatch(exec):
-    r = waterfall tools/execute (exec)                        # around-dispatch: timeout, checkpoint
-          innermost: tool.execute(args, exec) -> validate output schema -> render content
-    add deferred contexts; caller abort turns success into ABORTED
-finalize(exec, r):
-    r = ToolDefinition.projectContent(r)
-    decision = waterfall tools/post-execute (exec, r)         # accept | accept{content|value} | block
-    finish(r)
-finish(exec, r): materialize, ToolDefinition.finalizeContent(r), emit tools/result (frozen)
+# ---------- Running tools ----------
+run_tools(calls):
+    go through the calls in the order the model made them:
+        a tool that is safe to run alongside others (for example, read) joins a parallel batch
+        any other tool (for example, bash) waits for the batch to finish and runs alone
+        at most N tools run at once                               [config] maxParallelToolCalls (10)
 
-# ---- stop conditions ----
-# A turn ends when a step completes with no tool calls, a tool result sets
-# concludesTurn, a response hits max-tokens, agent/pre-step rejects, the first
-# claim is empty, the signal aborts, or an error escapes. Each requires an empty
-# next-step inbox after agent/turn-stopping. There is no step or turn cap.
+    for each call:
+        log the call before running it
+        ask plugins whether to allow it:                          [event] tools/pre-execute
+            allow, deny, cancel, or ask the user
+        if "ask": ask the user                                   [config] approval policy
+        if allowed: check guards (rules that can only deny)
+        if denied: the result is an error message the model will see
+        otherwise run the tool, wrapped by plugins                [event] tools/execute
+            (timeouts, saving the session to disk first)
+        let plugins rewrite or reject the result                  [event] tools/post-execute
+            (shorten huge output to a preview plus a file path,
+             add a reminder after the same call repeats 3, 5 or 8 times)
+
+    log the results in the order the model made the calls, whatever order they finished in
+    if the user stopped the turn, log "not run" results for calls that never started
+
+# ---------- Stop conditions ----------
+a turn ends when the model answers without tool calls, a tool ends the turn,
+the reply hits the output token limit, a plugin blocks the step, the user stops it,
+or an error is not retried. There is no limit on the number of steps.
 ```
 
-Source map:
+### Where each part lives
 
-- Inbox commands and wake/latch: `packages/core/agent-loop/src/agent.ts:154-235`; durable inbox and claim: `packages/core/agent-loop/src/inbox.ts:109-243`.
-- Driver loop: `packages/core/agent-loop/src/agent.ts:252-265`.
-- Turn: `packages/core/agent-loop/src/agent.ts:298-398`; pre-step: `agent.ts:267-288`.
-- Step, request attempt and retry: `packages/core/agent-loop/src/agent.ts:400-561`; `prepareRequest`: `agent.ts:564-613`; `buildRequest`: `agent.ts:616-704`.
-- System prompt and runtime-context projection: `packages/core/agent-loop/src/runtime-context.ts:88-103` and `:152-163`.
-- Stream framing: `packages/core/agent-loop/src/assistant-stream.ts:49-109`.
-- Tool scheduler: `packages/core/agent-loop/src/tool-calls.ts:60-243`; synthetic results: `tool-calls.ts:250-260`.
-- Concurrency classification: `packages/core/tools/src/index.ts:1309-1319`.
-- Per-call pipeline: `packages/core/tools/src/index.ts:1499-1550` (pre-execute, approval, guards), `:1570-1640` (execute), `:1647-1700` (post-execute, finalize, `tools/result`), `:1733-1776` (approval), `:1787-1830` (post-execute decisions).
-- Event declarations: `packages/core/agent/src/runtime-types.ts:250-394`; `tools/*` declarations: `packages/core/tools/src/index.ts:143-208`.
+- Sending a message: `packages/core/agent-loop/src/agent.ts:154-235` (`followup`, `steer`, `inject`, waking); the two-list inbox `packages/core/agent-loop/src/inbox.ts:109-243`; the driver loop `agent.ts:252-265`.
+- A turn: `packages/core/agent-loop/src/agent.ts:298-398`; the pre-step check `agent.ts:267-288`.
+- A step: `packages/core/agent-loop/src/agent.ts:400-561`; choosing the model `agent.ts:564-613`; building the request from the log `agent.ts:616-704`; system prompt and runtime context `packages/core/agent-loop/src/runtime-context.ts:88-103,152-163`; live streaming `packages/core/agent-loop/src/assistant-stream.ts:49-109`.
+- Running tools: `packages/core/agent-loop/src/tool-calls.ts:60-260`; deciding which tools run in parallel `packages/core/tools/src/index.ts:1309-1319`; the per-call checks and plugin events `packages/core/tools/src/index.ts:1499-1830`.
+- Event declarations: `packages/core/agent/src/runtime-types.ts:250-394`; `tools/*` events `packages/core/tools/src/index.ts:143-208`.
 
 ## What is configurable
 

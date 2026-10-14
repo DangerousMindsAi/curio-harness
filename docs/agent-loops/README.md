@@ -6,7 +6,7 @@ How the core agent loop works in opencode, DeepSeek Harness and Grok Build, writ
 - [deepseek-harness.md](deepseek-harness.md): a small replaceable driver (`ReactLoopAgent`) whose policy lives almost entirely in plugins on typed waterfalls.
 - [grok-build.md](grok-build.md): a session actor running an outer round loop (goal, Stop hooks) around an inner sampling loop with heavy harness-side control.
 
-Each document has the same sections: pseudo-code for the whole loop with every hook and config point marked inline, a source map, a table of what is configurable, the plugins and hooks that touch the loop, worked examples, notes for curio-harness, and corrections to the survey found while reading the code. Claims cite `path:line` at the same commits the survey used: opencode `8ffbcc2`, deepseek-harness `d743267`, grok-build `2bdd1d6`.
+Each document has the same sections: plain-language pseudo-code for the whole loop with every hook and config point marked, a map from each part to the source, a table of what is configurable, the plugins and hooks that touch the loop, worked examples, notes for curio-harness, and corrections to the survey found while reading the code. Claims cite `path:line` at the same commits the survey used: opencode `8ffbcc2`, deepseek-harness `d743267`, grok-build `2bdd1d6`.
 
 ## The three loops side by side
 

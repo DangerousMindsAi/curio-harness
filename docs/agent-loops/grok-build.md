@@ -6,188 +6,93 @@ Snapshot: [DangerousMindsAi/grok-build](https://github.com/DangerousMindsAi/grok
 
 ## Pseudo-code
 
-File names in the comments, and bare file names such as `turn.rs` or `tool_calls.rs` later in this document, are short forms; the "Source map" after the block gives their full paths.
+The loop has three levels. A **turn** answers one prompt. A turn runs one or more **rounds**: a round ends when the model stops calling tools, and a new round starts only if goal mode or a Stop hook wants more work. A round is a series of **sampling steps**; each step is one model call plus the tools it asks for. Lines marked `[hook]` are where user hooks can intervene, `[reminder]` marks a note the harness adds to the conversation, and `[config]` marks a setting; the tables below give the details.
 
 ```text
-# ===== Session actor: one per ACP session ============================ run_loop.rs:354
-run_session(session, cmd_rx, completion_rx, ...):
-  loop select (biased):
-    idle_flush_timer   -> background memory flush         # config: remote flush_idle_timeout_secs
-    dream_check_timer  -> memory consolidation (legacy memory pipeline)
-    model_switch       -> reset laziness-nudge counter
-    chat_state_event   -> after compaction: reset idle-flush length and first-turn memory flag
-    event_rx           -> replay buffer -> ACP session/update notifications
-    cmd_rx:
-      Prompt{blocks, json_schema, send_now, ...}                       # run_loop.rs:725
-          queue_input(); if send_now: cancel running turn
-          maybe_start_running_task()  # promote queue head, spawn run_task -> handle_turn_input
-      Cancel           -> flush replay buffer, abort turn task
-      InjectNotification / InterjectQueuedPrompt / SetAutoMode / SetYoloMode
-      ReloadPlugins / ReloadHooks / SetClientHooks / CompactSession / Rewind / ...
-      DispatchSessionStartHook -> fire                                  # hook: SessionStart
-      <channel closed> -> fire SessionEnd, memory pipeline, stop workflows, return  # hook: SessionEnd
-    completion_rx (turn task finished):                                # run_loop.rs:2294
-      flush replay buffer; emit TurnCompleted
-      handle_turn_end(succeeded)  # goal: queue continuation, or count failures and auto-pause
-      re-queue stranded interjections at queue front; start next queued prompt
+# ---------- The session ----------
+each session has one actor that handles commands one at a time:
+    a new prompt     -> put it in the queue; if nothing is running, start a turn
+                        ("send now" cancels the running turn first)
+    cancel           -> stop the running turn
+    turn finished    -> in goal mode, queue the next goal round; then start the next queued prompt
+    session closed   -> run SessionEnd hooks and stop                [hook] SessionEnd
 
-# ===== One prompt ===================================================== turn.rs:503
-handle_turn_input_inner(req):
-  resolve slash command / skill (human or model-authored authority)
-  if builtin slash command: return execute_builtin_slash_command()
-  if authority != ModelAuthoredUntrusted:
-    v = dispatch_prompt_submit_hook(UserPromptSubmit)                   # hook: UserPromptSubmit (Allow | Block)
-    block enforced only for real user input; other origins get an annotation only
-  if not blocked:
-    prompt_index += 1; file_state_tracker.begin_prompt(); echo user chunks to ACP
-    parse_prompt_with_skills(); normalize_images_with_notices()
-    maybe_truncate_large_prompt_with_skills()  # offload to prompts/prompt_{n}.txt, model gets excerpt
-    push user item typed by origin (user, task_completed, subagent_completed,
-         notification_drain, goal_summary, scheduler_fired, ...); FlushAndAck
-  if blocked: result = Cancelled(HookDenied)
-  else:
-    salvage = LengthSalvage::new(length_salvage_budget())  # config: GROK_LENGTH_SALVAGE, remote length_salvage_budget
-    stop_continuations = 0
-    loop:                                               # ----- outer round loop, turn.rs:1313
-      round = process_conversation_turn_with_recovery(json_schema, salvage)
-      if round is not Completed: break                  # Cancelled, MaxTurnsReached, StationarityEnded, Err
-      if Completed(Refusal): pause goal; break
-      if goal active:
-        if a user prompt is queued: break               # goal yields; continuation re-arms at turn end
-        d = run_goal_round_end()  (workflow engine) | run_goal_round_end_legacy()
-        if d == Continue(directive):
-          inject_goal_continuation_message(directive); continue   # reminder: goal directive
-      match run_stop_gate(prompt_id, stop_continuations):          # hook: Stop / SubagentStop
-        AllowStop            -> break
-        KeepWorking(feedback)-> stop_continuations += 1        # hard cap 8 per turn
-                                push stop_hook_feedback(feedback); continue
-  if Cancelled or MaxTurnsReached: cancel this turn's subagents
-  flush_to_disk(); file_state_tracker.end_prompt(); persist RewindPoint; flush again
-  record usage, telemetry, TurnEnded observability event
-  report turn end on failure/cancel                    # hook: StopFailure / StopCancelled (turn_end_hooks.rs)
-  map outcome -> acp::StopReason: EndTurn | MaxTokens | Refusal | Cancelled
-       (StationarityEnded -> EndTurn, MaxTurnsReached -> Cancelled)
+# ---------- A turn ----------
+run_turn(prompt):
+    if it is a built-in slash command, run it and stop
+    let hooks see the prompt and possibly block it               [hook] UserPromptSubmit
+    expand skills and images; if the prompt is huge, save it to a file
+        and give the model an excerpt
+    add the prompt to the conversation
 
-process_conversation_turn_with_recovery():             # turn.rs:1977
-  req = agent.completion_requirement()                 # config: agent definition completionRequirement
-  r = process_conversation_turn()
-  if no req or no req.recovery or r is MaxTurns/Stationarity or req.tool was called: return r
-  for attempt in 1..=recovery.max_retries:
-    sleep(min(base_delay * 2^(attempt-1), max_delay))
-    push auto_recovery(req.reminder)                   # reminder: completion requirement
-    r = process_conversation_turn(); if satisfied or MaxTurns/Stationarity: return r
-  notify AutoRecoveryExhausted; return r
+    loop:                                                        # rounds
+        result = run_round()
+        if the round did not finish normally (cancelled, step limit, stuck): stop
+        if goal mode is on and no other prompt is waiting:
+            ask the goal evaluator whether the goal is done
+            if not done: add its next instruction and run another round   [reminder]
+            if it looks done: a panel of skeptic subagents must agree first
+        ask the Stop hooks whether the agent may stop               [hook] Stop
+            if a hook says "keep working": add its feedback and run another round
+            (at most 8 times per turn)
+        stop
 
-# ===== Inner sampling loop ========================================== turn.rs:2615
-process_conversation_turn_inner(json_schema, salvage):
-  tool_defs = prepare_tool_definitions_timed()         # may wait for MCP servers
-  maybe_inject_mcp_connecting_reminder(); maybe_inject_mcp_reminder()       # reminder: MCP
-  if json_schema and backend lacks native schema: add StructuredOutput tool + reminder
-  identical = IdenticalToolCallRun(); todo_fires = 0; tool_turns = 1; per-step retry counters
-  loop:                                                                     # turn.rs:2747
-    emit LoopStarted
-    if identical.run_len >= hard_stop (12; 8 if every call is Read/Plan kind; 4 for `true`):
-      return StationarityEnded                                              # fixed constants
-    if identical.take_nudge() (at 8; 4 for Read/Plan): push stationarity nudge  # reminder
-    if not awaiting_length_continuation:
-      drain_interjections_at_safe_point()             # mid-turn user messages
-      flush_pending_skill_reminders()                 # reminder: skills
-      inject_pending_monitor_events()                 # monitor tool output
-    memory_reminder = first_turn_memory_reminder()    # reminder: memory (first turn only)
-    maybe_inject_mcp_reminder()
-    if two_pass_active and usage >= threshold - lead: spawn prefire pass 1  # config: features.two_pass_compaction, GROK_PREFIRE_LEAD_PERCENT
-    refresh_token_if_expired()
-    if check_auto_compact_needed(): run_compact_only()   # config: auto_compact_threshold_percent; hook: PreCompact/PostCompact
-    if long-reasoning reminder due: push REMINDER        # config: long_reasoning_reminder (default off)
-    tools = turn_base_tool_specs(tool_defs) (+ StructuredOutput); child projection for subagents
-    request = chat_state.build_request(tools, memory_reminder)
-    set x-grok headers, json_schema (native), hosted_tools, max_output_tokens
-    if salvage.enabled: request.length_policy = CompletePartial
-    outcome = run_turn_via_sampler(request)   # sampler: per-request retry (config: GROK_MAX_RETRIES / max_retries),
-                                              #   doom-loop resample (config: doom_loop_recovery);
-                                              #   stream -> ACP agent_message_chunk / thought / tool_call deltas
-    match outcome:
-      Err(max_tokens) while awaiting continuation:
-          if drain_interjections(): continue
-          return Completed(MaxTokens)
-      Err(e)                      -> return Err(e)
-      RetryTransient              -> sleep 2s/10s/30s (+jitter); continue  # config: turn_transient_retry
-      CompactAndResubmit          -> continue          # overflow: compaction already ran in recovery
-      RefreshAuthAndResubmit      -> AuthRetrySchedule: resubmit / back off / fail turn
-      Response(r)                 -> fall through
-    if media-gen batch is 2x over cap: push resample reminder; continue (once)
-    if Length && tool calls: streak += 1; > 5 -> return Err; else push OUTPUT_TOKEN_LIMIT_REMINDER once
-    record_response_items(r)                           # commit assistant items to chat state
-    if refusal and empty: emit notice chunk
-    if Length && no tool calls && no schema-valid answer:
-      match salvage.on_length_stop():
-        Continue -> push length_continue_reminder (once per run); continue  # reminder
-        Exhaust  -> fall through, turn is marked truncated
-    if no tool calls:
-      if TodoGate active and todos pending and todo_fires < max_fires:   # config: --todo-gate, todo_gate_enabled, todo_gate_max_fires_per_prompt
-        todo_fires += 1; push TodoGate reminder; continue                 # reminder
-      if drain_interjections_at_safe_point(): continue
-      finalize_turn_bookkeeping()
-      if drain_admitted_messages_at_safe_point(): continue  # late interjections, parent Steer
-      validate structured output against json_schema
-      return Completed(EndTurn | MaxTokens | Refusal)
-    if StructuredOutput tool called alone: validate -> return Completed | retry (max 3)
-    identical.observe(step_signature(tool_calls))      # canonical JSON args, order-insensitive
-    r = execute_tool_calls(tool_calls)
-    PermissionReject -> return Cancelled(PermissionRejected)
-    Cancelled        -> return Cancelled(PermissionCancelled)
-    FollowupMessage  -> push followup as user turn; continue
-    if tool_turns + 1 > max_turns: return MaxTurnsReached                 # config: --max-turns, agent maxTurns
-    tool_turns += 1
-    if check_preflight_overflow(): run_compact_only(); continue           # tool outputs overflowed window
+    save a rewind point so files and conversation can be rolled back
+    record usage and report how the turn ended to the client
 
-# ===== Tool dispatch ================================================== tool_calls.rs:335
-execute_tool_calls(calls):
-  reject excess media-gen calls
-  split exit_plan_mode calls into a trailing batch; run body batch, then tail batch
-  push deferred followups (hook notes, skill reminders) as user items
-  drain_interjections_at_safe_point(); flush_pending_skill_reminders()
+# ---------- A round ----------
+run_round():
+    loop:                                                         # sampling steps
+        if the model has made the same tool calls over and over:
+            after 4-8 repeats add a "you are repeating yourself" note       [reminder]
+            after 8-12 repeats end the turn
+        add anything that arrived in the meantime: messages the user typed
+            mid-turn, skill reminders, output from watched scripts
+        if the context is nearly full: summarize older history      [config] auto_compact_threshold_percent
+                                                                    [hook] PreCompact, PostCompact
+        call the model and stream the reply to the client
+            on network errors, rate limits or server errors: wait and retry   [config] max_retries (15)
+            if the server flags the reply as looping: retry with a warning
+            if the context is too long: summarize and retry
+            if the login expired: refresh it and retry
 
-execute_tool_calls_batch(calls):                                           # tool_calls.rs:484
-  if auto mode: refresh classifier transcript
-  for call in calls:                                   # sequential prepare
-    if an earlier call was rejected / cancelled / follow-up:
-      push synthetic "Tool execution cancelled due to earlier ..." result; continue
-    prepare_tool_call(call):                                               # tool_calls.rs:1445
-      parse args (recover concatenated JSON objects)
-      gate = PreToolUse hooks        # hook: PreToolUse -> Deny | Ask | Defer | Allow, updatedInput, additionalContext
-      MCP argument coercion; if it changed the input, run PreToolUse again
-      plan_mode_edit_gate(): in plan mode, edits outside the plan file -> "not executed" result
-      unless plan-file edit auto-approve:
-        decision = permissions.request(access_kind, hook_ask)
-          # rules deny > ask > allow, remembered grants, read-only auto-approvals, mode policy
-          # auto mode: fast path (allowlist, all edits) -> heuristic -> LLM classifier
-        PolicyDeny -> "not executed" result, continue loop                  # hook: PermissionDenied
-        Reject     -> PermissionReject (ends turn)                         # hook: PermissionDenied
-        Cancelled / FollowupMessage -> end batch
-    approved.push(prepared)
-  lock_paths = first of file_path | path | target_file per call (canonicalized)
-  create a tokio Mutex for each path that a non-read-only call in this batch targets
-  run all approved calls concurrently (FuturesUnordered); a call holds its path's mutex if one exists
-  as each finishes:
-    PostToolUse hooks (or PostToolUseFailure for MCP error results)   # hook: block feedback, additionalContext, output replacement
-    push tool_result; queue PreToolUse/PostToolUse notes as deferred followups
+        if the reply was cut off by the output limit:
+            with tool calls: add a reminder and carry on (the turn fails after 5 in a row)
+            without tool calls: ask it to continue, if allowed         [config] length salvage budget (off)
+
+        if the reply has no tool calls:
+            if todos are unfinished: remind the model and continue     [config] TodoGate (off)
+            if the user typed something mid-turn: continue with it
+            the round is done
+
+        run_tools(tool calls)
+        if a tool call was rejected by the user: end the turn
+        if the number of tool steps reached the limit: end the turn   [config] --max-turns (unlimited)
+
+# ---------- Running tools ----------
+run_tools(calls):
+    first check each call, one at a time, in order:
+        let hooks deny it, ask the user, or rewrite its arguments    [hook] PreToolUse
+        in plan mode, refuse edits to anything except the plan file
+        check permissions: rules, earlier approvals, and the mode    [config] permission mode
+            in auto mode, a quick check and then a language model decide
+        if denied by a rule or hook: the model sees "not executed" and can adapt
+        if the user rejects it: skip the remaining calls and end the turn
+
+    then run all approved calls at the same time,
+        except that calls writing to the same file take turns
+    after each call, let hooks add context or replace the result   [hook] PostToolUse
+    add the results to the conversation
 ```
 
-**Source map**
+### Where each part lives
 
-- Session actor select loop: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs:354` (loop at `:522`, `Prompt` arm `:725`, `Cancel` `:1143`, `ReloadPlugins` `:1192`, `ReloadHooks` `:1199`, `SetYoloMode` `:1263`, `SetAutoMode` `:1275`, `SetClientHooks` `:1792`, `DispatchSessionStartHook` `:1918`, completion arm `:2294`, `handle_turn_end` call `:2382`, `fire_session_end_hooks` `:78`).
-- Queue and task start: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_queue.rs:113`, `crates/codegen/xai-grok-shell/src/session/acp_session_impl/notification_drain.rs:119`, `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn_task.rs:482`.
-- Prompt handling: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:503` (slash resolve `:639`, `UserPromptSubmit` `:911`, enforcement `:918-937`, `parse_prompt_with_skills` `:985`, images `:1030`, offload `:1075`, user item `:1188-1240`, blocked prompt `:1285-1306`).
-- Offload: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_offload.rs:1-3,18,459`.
-- Outer round loop, goal, stop gate: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:1308-1398`; turn end and rewind point `:1399-1420`; StopReason mapping `:1688-1716`.
-- Completion requirement recovery: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:1977-2126`.
-- Stop gate: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/stop_gate.rs:9,236-336`.
-- Goal round end: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/goal.rs:1400-1492` (legacy `:2081`); turn-end goal handling `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:1926-1966`.
-- Inner loop: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:2615` (tool prep `:2670-2673`, structured output setup `:2719-2746`, loop `:2747`, stationarity `:2750,2789`, interjections/skills/monitor `:2829-2833`, memory `:2834`, prefire `:2853-2866`, auto-compact `:2869-2880`, long reasoning `:2881-2901`, build request `:2966`, length policy `:3024-3026`, sampler `:3051`, retry arms `:3062-3290`, media-gen `:3429`, Length tool-call streak `:3488`, commit `:3513`, length salvage `:3578`, TodoGate `:3624-3678`, completion `:3680-3725`, StructuredOutput `:3728`, signature `:3784`, dispatch `:3820`, max_turns `:3853`, preflight overflow `:3864-3874`, thresholds `:3896-3900`).
-- Sampler retry and recovery: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs:16-112,1195-1295,1716`; `crates/codegen/xai-grok-sampler/src/retry.rs:5-28`; `crates/codegen/xai-grok-sampler/src/doom_loop_recovery.rs:1-29`; `crates/codegen/xai-grok-shell/src/session/acp_session_impl/auth_retry.rs:111-117`.
-- Streaming to ACP: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampling_events.rs:122-330`.
-- Tool dispatch: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs:335-400` (batch `:484`, earlier-rejection results `:504-528`, locks `:622-650,787-790`, parallel `:1008`, PostToolUse notes `:1168-1205`, PreToolUse gate `:1301-1385`, prepare `:1445`, plan gate `:1714-1729`, permission request `:1849-1860`, decision mapping `:1923-1984`).
+- The session actor: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/run_loop.rs:354` (command loop `:522`, new prompt `:725`, cancel `:1143`, turn finished `:2294`, `SessionEnd` `:78`); prompt queue `prompt_queue.rs:113`.
+- A turn: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:503` (`UserPromptSubmit` `:911`, skills and images `:985-1030`, large-prompt offload `:1075` and `prompt_offload.rs`); the round loop with goal and Stop hooks `turn.rs:1308-1398`; Stop gate `stop_gate.rs:9,236-336`; goal evaluation `goal.rs:1400-1492`; skeptic panel `goal.rs:164-225,441-620`; rewind point and end of turn `turn.rs:1399-1420,1688-1716`.
+- A round: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs:2615` (loop `:2747`, repeated-call check `:2750-2828` with thresholds `:3896-3900`, mid-turn messages `:2829-2833`, compaction `:2853-2880`, model call `:3051`, retry handling `:3062-3290`, output-limit handling `:3488,3578`, TodoGate `:3624-3678`, step limit `:3851-3862`); retries in the sampler `crates/codegen/xai-grok-sampler/src/retry.rs:5-50`, looping detection `crates/codegen/xai-grok-sampler/src/doom_loop_recovery.rs:1-29`, login refresh `auth_retry.rs:111-117`.
+- Running tools: `crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs:335-400` (checking each call `:484-528,1445`, `PreToolUse` `:1301-1385`, plan mode `:1714-1729`, permissions `:1849-1984`, same-file locks `:622-650`, running in parallel `:1008`, `PostToolUse` `:1168-1205`).
+
+All files named without a directory in this list are in `crates/codegen/xai-grok-shell/src/session/acp_session_impl/`.
 
 ## What is configurable
 

@@ -6,149 +6,98 @@ Snapshot: [DangerousMindsAi/opencode](https://github.com/DangerousMindsAi/openco
 
 ## Pseudo-code
 
-```python
-# ---------- 1. Admission (any client: HTTP, TUI, SDK, subagent tool) ----------
-def Session.prompt(sessionID, input):                        # delivery defaults to "steer"
-    if admission.reconcile(id) exists: return it              # idempotent by message ID
-    event = hooks.trigger("session","prompt", {prompt, metadata, delivery})  # hook: session.prompt (mutate)
-    item  = materialize files/skills from event                # may change text/files/delivery
-    if session.revert: SessionRevert.commit()                  # staged revert committed before new work
-    publish InboxEnqueued(item)                                # projector inserts session_inbox row
-    SessionExecution.wake(sessionID)                           # advisory doorbell
-# compact() admits a "compaction" control item; move() admits a "move" control item; same inbox.
+The loop has three levels. A **run** starts when a session has new input and keeps going until the session is idle. A run is a series of **steps**; each step is one model call plus the tools that call asks for. A step may need several **attempts** if the model call fails and is retried. Lines marked `[hook]` are where plugins can intervene, and lines marked `[config]` are where settings change the behavior; the tables below give the details.
 
-# ---------- 2. Execution coordinator (one busy period per session) ----------
-def wake(sessionID, scope="input"):
-    if execution active: execution.pendingWake = widest(scope) # coalesce; re-drain before settling
-    else: start(): publish Execution.Started + durable claim    # write-ahead claim for crash recovery
-         loop: drain(sessionID, force, scope) until no pendingWake
-         on exit: publish Execution.Succeeded|Failed|Interrupted (+ release claim unless "shutdown")
+```text
+# ---------- Sending a message ----------
+when a client sends a message to a session:
+    let plugins rewrite the message                                [hook] session.prompt
+    save it to the session's inbox (a database table), marked "steer" or "queue"
+        # steer: deliver at the next step, even mid-run (the default)
+        # queue: deliver only once the session is idle
+    wake the session's runner (if it is already running, it notices the new item)
 
-# ---------- 3. Drain ----------
-def SessionRunner.drain(sessionID, force, continuation=None, promotable="input"):
-    if nothing promotable (or only queued items under a steer-only wake): return Complete
-    await plugins.awaitActivation
-    settleStaleCompactions(); settleStaleToolCalls()           # crash residue -> "interrupted" failures
-    step = continuation.step or 1; continuing = bool(continuation)
-    while True:
-        next = advanceToStep()                                 # may return Complete / Moved / Reloaded
-        if next is not Ready: return next                      # Moved/Reloaded -> re-drain at new Location
-        continuing = runStep(next.context, step)               # True iff local tools ran this step
-        step += 1
+# ---------- A run ----------
+when the runner wakes up:
+    record "run started" so a crash can be detected later
+    clean up anything a crashed earlier run left half-finished
+    step_number = 1
 
-def advanceToStep():
     loop:
-        if location closed: return Reloaded
-        pending = inbox.nextPromotable("input" if entering or not continuing else "steer")
-        if pending.type == "move": publish Moved; return Moved
-        if pending.type == "compaction":                       # manual /compact, steered ahead of prompts
-            compaction.compact(reason="manual")                # hook: session.compaction
-            continue
-        if not force and not continuing and no eligible pending: return Complete
-        selected = context.select(sessionID)                   # agent, permissions, tool snapshot, instructions
-        InstructionState.prepare(selected.instructions)        # durable session.instructions.updated deltas
-        promoted = inbox.promote(scope)                        # InboxDelivered -> user/synthetic messages
-        if promoted > 0:
-            step = 1                                           # config: agent.steps allowance resets on input
-            maybe fork title generation (top-level, untitled)  # hook: session.title (can supply title)
-        return Ready(context.load(selected))                   # resolve model + active history from SQLite
+        take any inbox items that are due now:
+            a "compact" request -> summarize the history now, then look again
+            a "move" request    -> move the session to another directory and restart there
+            new messages        -> add them to the history and reset step_number to 1
+        if nothing is due and the last step did not ask to continue:
+            stop the run
 
-# ---------- 4. Step (logical step policy) ----------
-def runStep(loaded, step):
-    assistantID = new(); retry = Retry.make()
-    recoverOverflow = recoverContinuation = True
-    while True:                                                # retries/compactions stay in the same step
-        loaded = loaded or prepareContext() + context.load()   # refresh history; never promotes more input
-        c = compaction.compact(reason="auto", context=loaded)  # config: compaction.auto/buffer/keep
-        if c.failed: raise StepFailed
-        if c.completed: assistantID = new(); continue          # rebuild from the new checkpoint
-        limit = loaded.agent.steps is set and step >= loaded.agent.steps   # config: agent.steps
-        transcript = baseTranscript(agent.system or SystemPrompt(tool names), instructions baseline, history)
-        messages = transcript.messages + ([assistant(MAX_STEPS_PROMPT)] if limit else [])
-        prepared = context.request.primary(                    # SessionModelRequest.prepare("primary")
-            system, messages, tools=loaded.tools,              # tools already filtered by permissions
-            toolChoice="none" if limit else None,              # tool defs kept for prompt-cache prefix
-            maxTokens=outputLimit(model.limit, inputTokens))
-            #   hook: session.context      (mutate system/messages/options/tools; rename/remove tools)
-            #   hook: session.model.request (mutate baseURL/headers)
-            #   hook: session.http.request / http.response (wrap each HTTP exchange)
-            #   hook: session.experimental.ws.{handshake,send,receive} (if config: provider transport=websocket)
-        outcome = attempt(prepared, retry=retry.decide, recoverOverflow, recoverContinuation)
-        match outcome:
-            Completed(needsContinuation): return needsContinuation
-            Retry(decision):    retry.wait(decision)           # publish RetryScheduled, sleep; same assistantID
-            Continue(decision): retry.wait(); publish Synthetic("continue where you left off"); assistantID = new()
-            OutputLimit(nc):    if last 3 user/assistant msgs are all finish=length: raise StepFailed
-                                if nc: return True
-                                publish Synthetic("hit output limit, break work up"); assistantID = new()
-            Compacted:          recoverOverflow = False; assistantID = new()   # one overflow compaction per step
-            RecoverFull:        recoverContinuation = False                    # one full-context rebuild
+        load the agent, its permissions, its tools and the history from the database
+        keep_going = run_step(step_number)
+        step_number += 1
 
-# ---------- 5. Attempt (one physical model call) ----------
-def attempt(prepared):
-    startSnap = fork(snapshots.capture())                      # config: snapshots (git only)
-    for event in llm.stream(prepared.request):                 # own @opencode/ai client
-        if overflow error before any output: remember; skip
-        publisher.publish(event)                               # Step.Started, text/reasoning, Tool.Called ...
-        if event is tool-call and not providerExecuted:        # eager, parallel dispatch
-            fork:
-                if toolChoice == "none": Tool.Error("Tools are disabled after the maximum agent steps")
-                r = prepared.executeTool(call):
-                    ev = hooks.trigger("tool","execute.before") # hook: tool.execute.before (rewrite input/name, or fail)
-                    reject if tool not advertised in this request
-                    tool.execute(decoded input):                # tool calls Permission.assert itself
-                        rules = agent.permissions + session.permissions + saved "always" rules
-                        effect = last matching rule (default "ask")          # config: permissions, agents.*.permissions
-                        hooks.trigger("permission","evaluate")  # hook: permission.evaluate (can change effect)
-                        deny -> BlockedError; ask -> wait for user reply
-                        decline -> defect tunnel; decline with feedback -> model-visible failure
-                    hooks.trigger("tool","execute.after")      # hook: tool.execute.after (rewrite result/error)
-                r = toolOutput.truncate(r)                     # config: tool_output.max_lines/max_bytes
-                publisher.toolExecution(r) or failTool(err)    # Tool.Success / Tool.Failed
-    join all tool fibers; classify declines / interrupts / defects
-    if overflow before output and recoverOverflow(): return Compacted   # compaction reason="overflow"
-    if transport asks retry-full and no output: return RecoverFull
-    if llm error: d = retry.decide(error)                      # hook: session.retry (override decision/delay)
-        if d.retry and no output yet: return Retry(d)
-    fail unsettled tools; endSnap = snapshots.capture(); files = diff(startSnap, endSnap)
-    publish Step.Ended(finish, usage, cost, snapshot, files) or Step.Failed
-    if retryable error after output: return Continue(d)
-    if user declined a tool: raise Interrupt                   # ends the whole execution, not just the step
-    if record.failure (provider error, content filter): raise StepFailed
-    nc = toolChoice != "none" and any local tool was called
-    return OutputLimit(nc) if finish == "length" else Completed(nc)
+    record "run finished"
 
-# ---------- 6. Interruption ----------
-def Session.interrupt(sessionID, resume=False):
-    coordinator.interrupt -> Fiber.interrupt(owner)            # streams/tools interrupted; uninterruptible
-    # settlement still publishes failed tools, Step.Failed, Execution.Interrupted; user stop cancels jobs
-    if resume and next inbox item is steer/control: wake(sessionID, "steer")
+# ---------- A step ----------
+run_step(step_number):
+    loop:                                       # repeats only for retries and recoveries
+        if the history is close to the context window:             [config] compaction.*
+            summarize older history into a checkpoint and rebuild
 
-# ---------- 7. Crash recovery (server boot) ----------
-def SessionRestart.resumeSuspendedSessions():
-    for background job (shell, subagent) left pending: deliver synthetic outcome or resume child
-    for each top-level session still holding a claim:
-        attempts = countResume()                               # durable; default max 10 per turn
-        if attempts > max: publish Execution.Failed(RESUME_EXHAUSTED)
-        else: publish Synthetic("The server restarted ... continue"); execution.resume(sessionID)
+        build the request: system prompt, instructions, history, tool list
+        if step_number has reached the agent's step limit:         [config] agents.<name>.steps
+            add a note asking the model to wrap up, and disallow tool calls
+        let plugins edit the request (prompt, messages, tools, options)  [hook] session.context
+        let plugins edit the HTTP call (URL, headers, raw request)       [hook] model.request, http.*
+
+        result = attempt(request)
+
+        if result is "finished":           return whether any tools ran
+        if result is "retry":              wait (backoff), then try again
+        if result is "cut off mid-answer": keep the partial answer, add "continue where you left off", try again
+        if result is "hit output limit":   add "you hit the output limit, break the work up", try again
+                                           (fail the step on the third cut-off reply in a row)
+        if result is "context overflow":   summarize the history once, then try again
+
+# ---------- An attempt: one model call ----------
+attempt(request):
+    start a file snapshot (so the step can be undone later)       [config] snapshots
+    stream the model's reply, saving each piece to the database as it arrives
+    whenever a complete tool call arrives, start running it in the background right away:
+        let plugins rewrite or reject the call                     [hook] tool.execute.before
+        check permissions: allow, deny, or ask the user            [config] permissions
+                                                                   [hook] permission.evaluate
+        run the tool
+        let plugins rewrite the result                             [hook] tool.execute.after
+        if the output is too long, keep the first part and save    [config] tool_output.*
+            the full text to a file the model can read
+        save the result
+    wait for every tool to finish
+    take the end snapshot and record which files changed
+
+    if the call failed before producing anything:
+        ask whether to retry                                       [hook] session.retry
+    if the user declined a permission prompt: stop the whole run
+    return finished / retry / cut off / hit output limit / context overflow
+        # "keep going" is true only if at least one local tool ran
+
+# ---------- Interruptions and crashes ----------
+when the user presses stop:
+    cancel the model call and running tools; record them as interrupted
+    messages still waiting in the inbox are kept
+
+when the server starts:
+    for each session whose last run never recorded "run finished":
+        add a note that the server restarted and resume it (at most 10 times per run)
 ```
 
-### Source map
+### Where each part lives
 
-- Admission: `packages/core/src/session/session.ts:145-178` (prompt, revert commit, wake at `:174`), `packages/core/src/session/prompt.ts:29-90` (`session.prompt` hook at `:40-51`), `packages/core/src/session/inbox.ts:169-202` (admit), `:204-228` (compaction control).
-- Coordinator: `packages/core/src/session/execution.ts:81-148` (claim and terminal events), `packages/core/src/session/run-coordinator.ts:74-85` (drain loop with doorbell), `:87-112` (start), `:136-145` (wake coalescing).
-- Drain: `packages/core/src/session/runner/llm.ts:57-199`; stale settlement `:332-385`.
-- advanceToStep: `packages/core/src/session/runner/llm.ts:74-189`; promotion `packages/core/src/session/inbox.ts:407-424`, `:496-531`, compaction reordering ahead of earlier steers `:533-550`; step reset `llm.ts:109-112,181`; title fork `llm.ts:177-180`.
-- Context selection: `packages/core/src/session/context.ts:121-179` (tool snapshot filtered by merged permissions at `:131,134`; instruction ordering `:150-158`).
-- Step: `packages/core/src/session/runner/llm.ts:209-330`; auto compaction `:220-225`; max steps `:226-247` and `packages/core/src/session/runner/max-steps.ts:1`.
-- Request preparation: `packages/core/src/session/model-request.ts:88-98` (output limit), `:100-120` (base transcript), `:236-420` (prepare), `:253-265` (context hook), `:305-320` (`model.request`), `:337-365` (HTTP hooks), `:368-392` (WebSocket hooks), `:398-399` (retry hook), `:404-418` (executeTool), `:422-431` (hook per request kind).
-- Attempt: `packages/core/src/session/runner/step.ts:73-286`; snapshot fork `:76`; eager dispatch `:122-134`; max-steps tool guard `:91-93`; overflow `:155-167`; RecoverFull `:182-188`; retry decision `:189-204`; Step.Ended `:234-261`; Continue `:263-271`; decline interrupt `:274-277`; continuation flag `:281-283`; classification `:298-321`.
-- Tool.Called before execution: `packages/core/src/session/runner/publish-llm-event.ts:501-518`; continuation flag `:653-662`; content filter `:587-590`.
-- Tool pipeline: `packages/core/src/tool.ts:103-156` (before/after hooks), `:263-284` (dispatch); truncation `packages/core/src/tool-output.ts:67-118`.
-- Permissions: `packages/core/src/permission.ts:87-96` (last match wins, default ask), `:158-189` (rule merge and `evaluate` hook), `:231-260` (assert, decline tunnel at `:253`).
-- Retry: `packages/core/src/session/runner/retry.ts:32-60` (schedule), `:64-91` (policy and hook), `:94-114` (wait).
-- Interruption: `packages/core/src/session/execution.ts:153-170`, `packages/core/src/session/run-coordinator.ts:147-167`.
-- Crash recovery: `packages/core/src/session/execution/restart.ts:15-99`, `:192-231`; `packages/core/src/session/store.ts:194-204`.
+- Sending a message: `packages/core/src/session/session.ts:145-178`, `packages/core/src/session/prompt.ts:29-90` (`session.prompt` hook at `:40-51`), `packages/core/src/session/inbox.ts:169-228`.
+- Waking the runner and recording the run: `packages/core/src/session/run-coordinator.ts:74-145`, `packages/core/src/session/execution.ts:81-148`.
+- A run (`SessionRunner.drain` and `advanceToStep`): `packages/core/src/session/runner/llm.ts:57-199`; crash cleanup `:332-385`; inbox promotion `packages/core/src/session/inbox.ts:407-424,496-550`; step-number reset `llm.ts:181`; loading the agent, permissions and tools `packages/core/src/session/context.ts:121-179`.
+- A step (`runStep`): `packages/core/src/session/runner/llm.ts:209-330`; auto compaction `:220-225`; step limit `:226-247` and `packages/core/src/session/runner/max-steps.ts:1`; request building and hooks `packages/core/src/session/model-request.ts:100-120,236-431`.
+- An attempt (`SessionStep.attempt`): `packages/core/src/session/runner/step.ts:73-286`; snapshot `:76`; tools started as they stream in `:122-134`; overflow `:155-167`; retry decision `:189-204`; decline stops the run `:274-277`; tool hooks `packages/core/src/tool.ts:103-156`; permissions `packages/core/src/permission.ts:87-96,158-260`; output truncation `packages/core/src/tool-output.ts:67-118`; retry policy `packages/core/src/session/runner/retry.ts:32-114`.
+- Interruptions and crashes: `packages/core/src/session/execution.ts:153-170`, `packages/core/src/session/execution/restart.ts:15-99,192-231`.
 
 ## What is configurable
 
