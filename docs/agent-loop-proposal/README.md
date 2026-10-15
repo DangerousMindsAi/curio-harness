@@ -20,9 +20,11 @@ This builds on the [architecture survey](../harness-survey/README.md), the [agen
 - [The loop](#the-loop)
 - [Checkpoint and resume](#checkpoint-and-resume)
 - [Quiesce and graceful shutdown](#quiesce-and-graceful-shutdown)
+- [Inbound messages](#inbound-messages)
+- [Migrating an agent between hosts](#migrating-an-agent-between-hosts)
 - [Isolation in a multi-tenant process](#isolation-in-a-multi-tenant-process)
 - [Worked example](#worked-example)
-- [Open questions](#open-questions)
+- [Decisions and open questions](#decisions-and-open-questions)
 - [What this borrows](#what-this-borrows)
 
 ## Summary
@@ -35,7 +37,9 @@ The default driver is a small loop in the style of DeepSeek Harness. Each turn i
 
 Checkpointing is event-sourced. The log is forced to disk before every model request and before every tool body, and a snapshot of plugin state slots is written at step boundaries. Resume rebuilds the context from the recorded configuration, restores the last snapshot, replays the events after it, and patches any loose ends the same way DeepSeek does.
 
-Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), writes a snapshot and a `Quiesced` marker, and releases the session. A quiesced agent resumes exactly where it stopped, with no repair and no user message needed. None of the three surveyed harnesses can do this.
+Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), writes a complete snapshot and a `Quiesced` marker, and releases the session. A quiesced agent resumes exactly where it stopped, from the snapshot alone, with no replay, no repair and no user message needed. None of the three surveyed harnesses can do this.
+
+Quiesce is also how agents move between hosts when a cluster is resized. Every inbound message carries a sender-assigned timestamp and a checksum; the agent keeps pending messages sorted by that pair and drops duplicates, so messages that arrive while the agent is quiesced, arrive at both the old and the new host, or are forwarded twice are all admitted exactly once and in the same order. A fencing epoch on the session store guarantees that only one host can write to the agent at a time. The move is invisible to senders.
 
 ## Requirements and where each is met
 
@@ -46,6 +50,7 @@ Quiesce is a first-class phase. A drain request stops new work from being admitt
 | Checkpoint and resume | Write-ahead save points, snapshots of state slots at step boundaries, and a resume procedure that replays and repairs ([Checkpoint and resume](#checkpoint-and-resume)). Graceful quiesce is covered in its own section. |
 | Many agents per process, configured independently, strictly isolated, all state in a context variable | One `AgentCtx` per agent holding all mutable state; immutable plugin instances; per-agent capability grants and quotas; isolation level chosen per runner kind ([Isolation](#isolation-in-a-multi-tenant-process)). |
 | Plugins are a runner plus code | `Runner::load(code) -> Plugin` with code being configuration, a WASM component, or an external program ([Runners and code](#runners-and-code)). |
+| Move agents between hosts transparently when resizing a cluster | Quiesce, thaw on the new host, forward messages from the old host, deduplicate and sort, then resume ([Inbound messages](#inbound-messages), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
 
 ## Vocabulary
 
@@ -60,6 +65,10 @@ Quiesce is a first-class phase. A drain request stops new work from being admitt
 - **Hook**: a typed interception point the driver or tool pipeline dispatches to every subscribed plugin, in order.
 - **Turn / step / attempt**: as in DeepSeek. A turn answers one input; a step is one model request plus its tools; an attempt is one try at the request.
 - **Safe point**: a moment where the agent's state is consistent and can be snapshotted or quiesced: before a step starts, or after a turn ends.
+- **Envelope**: the wrapper on every inbound message, carrying a sender-assigned timestamp and a checksum. The pair `(timestamp, checksum)` is the message's sort key, and the checksum is its identity for deduplication.
+- **Spool**: a durable, append-only file of envelopes kept by a host for an agent that is not running there. Appending needs no lease.
+- **Epoch**: a counter on the agent's session store that increases each time a host takes ownership. Writes carrying an older epoch are refused.
+- **Thaw**: loading a quiesced agent's snapshot on a host and taking ownership, without starting to run it.
 
 ## Process layout
 
@@ -69,6 +78,8 @@ process
     ├── RunnerRegistry: kind -> Arc<dyn Runner>
     ├── StoreBackends:  where session logs live (files, SQLite, object store)
     ├── Scheduler:      per-tenant quotas, admission, fair sharing of model/tool slots
+    ├── Ingress:        receives envelopes; routes to a live agent or appends to its spool
+    ├── Spools:         AgentId -> durable spool, for agents quiesced on or moving off this host
     └── agents: AgentId -> AgentHandle      (a channel sender, no state)
 
 agent task (one per live agent, owns everything below)
@@ -77,8 +88,8 @@ agent task (one per live agent, owns everything below)
     ├── plugins         immutable instances, in hook order, plus a service index
     ├── state           one slot per plugin
     ├── log             append-only session log (via the SessionStore plugin)
-    ├── inbox           next_turn / next_step, durable
-    ├── phase           Idle | Running | Draining | Parked | Quiesced | Closed
+    ├── inbox           pending envelopes sorted by (timestamp, checksum), seen set, next_turn / next_step
+    ├── phase           Idle | Running | Draining | Parked | Quiesced | Thawed | Closed
     ├── counters        steps, turns, forced continuations, tokens
     ├── grants          what this agent may touch (fs roots, hosts, secrets, services)
     └── cancel, quota   cancellation token, tenant quota handle
@@ -88,11 +99,13 @@ Outside callers talk to an agent only through its `AgentHandle`:
 
 ```rust
 pub enum Command {
-    Send { input: UserInput, delivery: Delivery },   // Delivery::NextTurn | NextStep
+    Send { envelope: Envelope },                     // see Inbound messages; delivery is inside
+    Merge { envelopes: Vec<Envelope> },              // a batch forwarded from another host's spool
     Cancel { reason: CancelReason },                 // abort the current turn
     Drain { at: DrainPoint, deadline: Instant, reply: oneshot::Sender<DrainResult> },
     Answer { request: RequestId, answer: Answer },   // approval or question from a plugin
     Reconfigure { patch: ConfigPatch },              // applied at the next safe point
+    Release,                                         // leave Thawed and start running
 }
 
 pub struct AgentHandle { tx: mpsc::Sender<Command>, id: AgentId, tenant: TenantId }
@@ -111,7 +124,7 @@ pub struct AgentCtx {
     plugins: PluginTable,            // Box<dyn Plugin> in hook order + service index
     state: StateSlots,               // PluginId -> Box<dyn PluginState>
     log: SessionLog,                 // append, sync, read; backed by the SessionStore service
-    inbox: Inbox,                    // next_turn, next_step; every insert is a log event
+    inbox: Inbox,                    // sorted, deduplicated pending set; admission is a log event
     phase: Phase,
     counters: Counters,              // derived from the log; cached here
     grants: Grants,                  // capabilities granted by config, per plugin
@@ -125,7 +138,8 @@ pub enum Phase {
     Running { turn: TurnId },
     Draining { at: DrainPoint, deadline: Instant, waiters: Vec<oneshot::Sender<DrainResult>> },
     Parked { waiting_on: RequestId },  // e.g. a human approval; may be evicted from memory
-    Quiesced,
+    Quiesced,                          // snapshot written, lease released; task has exited
+    Thawed { epoch: Epoch },           // loaded and owned on this host, accepting messages, not running
     Closed,
 }
 
@@ -225,12 +239,12 @@ The runner kind decides what "code" means and how strongly that code is isolated
 |---|---|---|---|
 | `builtin.*` (one runner per feature: `builtin.react-driver`, `builtin.compaction`, `builtin.tool.bash`, `builtin.model.openai-compat`, ...) | Inline TOML table, validated against the runner's config schema | In the host, as compiled Rust | Trusted code; isolation comes from the context and grants |
 | `wasm` | A WASM component implementing a WIT world that mirrors the `Plugin` hooks | In the host, one WASM instance per plugin per agent | Separate linear memory, fuel and memory limits per instance, host calls only through grants |
-| `process` (`process.python`, `process.node`, ...) | A package or directory with an entry point | A child process per agent (or per tenant, by config), speaking the hook protocol over JSON-RPC on stdio | OS process boundary, plus the sandbox the `process` runner applies |
+| `process` (`process.python`, `process.node`, ...) | A package or directory with an entry point | A child process per agent, speaking the hook protocol over JSON-RPC on stdio | OS process boundary, plus the sandbox the `process` runner applies |
 | `mcp` | An MCP server spec | Wherever the MCP server runs | Tools only; each MCP tool becomes a `Tool` service |
 
 A "configuration file" plugin and an "entire application in a higher-level language" plugin are then the same thing to the loop: both are `Box<dyn Plugin>` with subscriptions. The `process` runner translates `on_hook` into a request to the child and the reply into a `Flow`; the hook payload crosses the boundary as JSON, which is also what the session log stores.
 
-The WASM and process runners both need a language-neutral description of the hooks. Writing it once as a WIT world and generating the JSON-RPC schema from it keeps the two in step.
+A Rust plugin implements the `Plugin` trait directly, but a plugin written in Python or compiled to WASM cannot see Rust traits. Each of those runners therefore needs the hook list, payload types and `Flow` results written down in a language-neutral form: a WIT world for WASM components, and a JSON-RPC schema for processes. The decision is to define the hooks once, as WIT, and generate the JSON-RPC schema and the Rust bindings from it, so that adding a hook or a payload field cannot leave one runner behind the others.
 
 ## Hooks
 
@@ -277,7 +291,13 @@ This is the default `Driver` plugin, `builtin.react-driver`. Lines marked `// [h
 async fn run(&self, cx: &mut AgentCtx) -> Result<Exit, DriverError> {
     dispatch(cx, Hook::AgentLoaded).await?;                       // [hook] agent_loaded
     loop {
-        cx.apply_pending_commands()?;          // Send, Cancel, Drain, Answer, Reconfigure
+        cx.apply_pending_commands()?;          // Send, Merge, Cancel, Drain, Answer, Reconfigure, Release
+
+        // Thawed: owned on this host and accepting messages, but not running until Release.
+        if let Phase::Thawed { .. } = cx.phase {
+            cx.wait_for_command().await;
+            continue;
+        }
 
         // Safe point: between turns.
         if let Some(exit) = settle_drain(cx, DrainPoint::Turn).await? {
@@ -456,10 +476,13 @@ A turn ends when the model answers without tool calls, a tool concludes the turn
 The session log is the source of truth. It holds three kinds of record:
 
 1. **A header** written once at creation: agent id, tenant, the full `AgentConfig` with every runner kind, code digest and grant, and each runner's `state_version`.
-2. **Events**: inbox inserts, turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations.
-3. **Snapshots**: at a safe point, one record holding every state slot (serialized with its runner's format and version), the inbox, the counters, and the log offset it covers.
+2. **Events**: message admissions (each with its envelope's timestamp and checksum), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations.
+3. **Snapshots**: at a safe point, one record holding state slots (serialized with each runner's format and version), the inbox with its seen set, the counters, and the log offset it covers.
 
-Plugins whose state can be derived from events (retry counters, repeat counters) can mark their slot `derived` and rebuild it in `replay` instead of serializing it. Plugins with opaque state, such as a Python application, contribute a blob through the `snapshot` hook.
+There are two kinds of snapshot, because crash recovery and quiesce have different needs.
+
+- **Periodic snapshots** are optional and off by default (`[config] snapshot.every_steps`). Crash recovery replays the log from the start, or from the last periodic snapshot if there is one, and a little extra time on resume after a crash is acceptable. Plugins whose state can be derived from events (retry counters, repeat counters) mark their slot `derived` and rebuild it in `replay`, so a periodic snapshot may leave those slots out.
+- **The quiesce snapshot** is complete. It holds every slot, derived ones included, plus the full inbox and seen set, so resuming from it needs no replay at all. The only new input on resume is whatever messages arrived while the agent was quiesced. Plugins with opaque state, such as a Python application, contribute a blob through the `snapshot` hook in both kinds.
 
 ### When it is forced to disk
 
@@ -468,17 +491,23 @@ Plugins whose state can be derived from events (retry counters, repeat counters)
 | Before each model request | The request can be rebuilt exactly; a crash during streaming loses only the partial reply |
 | Before each tool body (`ToolStarted`) | Resume can tell "might have run" from "never ran" ([crash recovery note 2](../crash-recovery/README.md#notes-for-curio-harness)) |
 | End of each turn | A finished turn is never lost |
-| At quiesce | The agent can be resumed with no repair |
+| Message admission | A message the sender has been told was received is never lost |
+| At quiesce | The agent can be resumed from the snapshot with no replay or repair |
 
-Between save points the `SessionStore` plugin may batch writes. Snapshots are taken at step boundaries when the snapshot policy says so (every N steps or M bytes of log, `[config]`), and always at quiesce. A snapshot is an optimization for resume time, never needed for correctness: resume from the header and the full event stream gives the same context.
+Between save points the `SessionStore` plugin may batch writes. Periodic snapshots are an optimization for crash-resume time and never needed for correctness: resume from the header and the full event stream gives the same context. The quiesce snapshot is the exception, since a thawed agent is built from it directly.
+
+Storage is configurable per agent: the `SessionStore` is a plugin, so the backend (local JSONL files, SQLite, an object store) is chosen in the agent's config. Moving an agent between hosts needs the new host to reach the same log, which means either a shared backend or a store plugin that ships the log with the quiesce snapshot.
 
 ### Resume
 
 ```rust
-pub async fn resume(rt: &Runtime, id: AgentId, policy: ResumePolicy)
+/// Take ownership of an agent on this host. Used after a crash, after a
+/// local quiesce, and as the thaw step of a move between hosts.
+pub async fn resume(rt: &Runtime, id: AgentId, start: StartMode)
     -> Result<AgentHandle, ResumeError>
 {
-    // 1. Exclusive ownership. A second process or a second in-process resume is refused.
+    // 1. Exclusive ownership. Opening bumps the store's epoch; every later write
+    //    carries it, and the store refuses writes from any older epoch.
     let store = rt.store_for(&id).open(&id, LeaseMode::Exclusive).await?;
     let header = store.read_header().await?;
 
@@ -486,57 +515,73 @@ pub async fn resume(rt: &Runtime, id: AgentId, policy: ResumePolicy)
     //    digest mismatch fails loud; nothing silently falls back.
     let mut cx = AgentCtx::build(rt, &header.config, store).await?;
 
-    // 3. Restore the last snapshot, migrating slots whose runner version moved.
-    let snap = cx.log.latest_snapshot().await?;
-    if let Some(snap) = &snap {
-        for (pid, slot) in &snap.slots {
-            let runner = rt.runners.get(&header.config.plugin(pid).runner)?;
-            let blob = if slot.version == runner.state_version() { slot.blob.clone() }
-                       else { runner.migrate(slot.blob.clone(), slot.version)? };
-            cx.state.insert(pid, cx.plugins[pid].decode_state(blob)?);
+    match cx.log.tail_marker().await? {
+        // Fast path: the log ends with a quiesce marker and a complete snapshot.
+        Some(Marker::Quiesced { snapshot, suspended_turn }) => {
+            restore_slots(rt, &mut cx, &header, &snapshot, Completeness::Full)?;
+            cx.inbox = snapshot.inbox;               // pending messages and seen set
+            cx.counters = snapshot.counters;
+            cx.log.append(Event::Thawed { host: rt.host_id(), epoch: cx.log.epoch() })?;
+            if let Some(turn) = suspended_turn { cx.inbox.resume_turn(turn); }
         }
-        cx.inbox = snap.inbox.clone();
-        cx.counters = snap.counters.clone();
-    }
 
-    // 4. Replay events after the snapshot. Hooks see Replay and must not cause side effects.
-    for event in cx.log.events_after(snap.map(|s| s.offset)).await? {
-        cx.fold(&event);                                  // inbox, counters, phase
-        dispatch(&mut cx, Hook::Replay(&event)).await?;   // [hook] replay
-    }
-
-    // 5. Classify how the log ends, and patch it.
-    match classify_tail(&cx.log) {
-        Tail::Clean => {}                                 // idle between turns
-        Tail::Quiesced { suspended_turn } => {
-            cx.log.append(Event::Resumed { from: ResumeFrom::Quiesce })?;
-            if let Some(turn) = suspended_turn { cx.inbox.resume_turn(turn); }  // continues by itself
-        }
-        Tail::Crashed { open_turn, dangling } => {
-            for call in dangling {
-                let text = if call.started_durably {
-                    "Its outcome is unknown. Retry only if the operation is read-only or \
-                     idempotent; otherwise verify external state or ask the user first."
-                } else {
-                    "It was not run. Retry it if it is still needed."
-                };
-                cx.log.append(Event::ToolResult(ToolResult::synthetic_error(call.id, text)))?;
+        // Slow path: no quiesce marker, so the process stopped without draining.
+        _ => {
+            let snap = cx.log.latest_snapshot().await?;          // periodic, if any
+            if let Some(snap) = &snap {
+                restore_slots(rt, &mut cx, &header, snap, Completeness::Partial)?;
+                cx.inbox = snap.inbox.clone();
+                cx.counters = snap.counters.clone();
             }
-            cx.log.append(Event::StepEnded { reason: StepEnd::Interrupted })?;
-            cx.log.append(Event::TurnEnded { end: TurnEnd::Interrupted })?;
-            cx.counters.crash_resumes += 1;
-            if policy.continue_after_crash(&cx.counters) {    // [config] Wait | Continue { max }
-                cx.inbox.push_next_turn(Input::system(RESTARTED_NOTICE), &mut cx.log)?;
+            // Replay events after the snapshot (or from the start). Hooks see
+            // Replay and must not cause side effects.
+            for event in cx.log.events_after(snap.map(|s| s.offset)).await? {
+                cx.fold(&event);                                 // inbox, counters, phase
+                dispatch(&mut cx, Hook::Replay(&event)).await?;  // [hook] replay
+            }
+            if let Tail::Crashed { dangling, .. } = classify_tail(&cx.log) {
+                repair_crash(&mut cx, dangling)?;
+                if header.config.resume.after_crash.should_continue(&cx.counters) { // [config]
+                    cx.inbox.push_next_turn(Input::system(RESTARTED_NOTICE), &mut cx.log)?;
+                }
             }
         }
+    }
+
+    // 3. Pull in anything this host spooled for the agent while it was not running here.
+    for env in rt.spools.drain(&id).await? {
+        cx.inbox.offer(env);                     // sorted insert; duplicates dropped
     }
     cx.log.sync().await?;
 
+    // 4. Run now, or stay thawed (owned, accepting messages, not running) until Release.
+    cx.phase = match start {
+        StartMode::Run => Phase::Idle,
+        StartMode::Thawed => Phase::Thawed { epoch: cx.log.epoch() },
+    };
     Ok(rt.spawn_agent(cx))   // the Driver plugin's run() takes over
+}
+
+fn repair_crash(cx: &mut AgentCtx, dangling: Vec<DanglingCall>) -> Result<(), DriverError> {
+    for call in dangling {
+        let text = if call.started_durably {
+            "Its outcome is unknown. Retry only if the operation is read-only or \
+             idempotent; otherwise verify external state or ask the user first."
+        } else {
+            "It was not run. Retry it if it is still needed."
+        };
+        cx.log.append(Event::ToolResult(ToolResult::synthetic_error(call.id, text)))?;
+    }
+    cx.log.append(Event::StepEnded { reason: StepEnd::Interrupted })?;
+    cx.log.append(Event::TurnEnded { end: TurnEnd::Interrupted })?;
+    cx.counters.crash_resumes += 1;
+    Ok(())
 }
 ```
 
-The crash branch uses DeepSeek's honest wording for an interrupted tool and opencode's optional automatic continuation with a resume cap. Whether a crashed turn continues by itself is a per-agent `[config]` choice, defaulting to `Wait`; an unattended agent would set `Continue { max: 3 }` or similar.
+`restore_slots` decodes each slot with its plugin, calling `Runner::migrate` first when the slot's version is older than the runner's. With `Completeness::Full` a missing slot is an error, because the quiesce snapshot promised every slot; with `Partial`, derived slots are rebuilt by replay.
+
+The crash branch uses DeepSeek's honest wording for an interrupted tool and opencode's optional automatic continuation with a resume cap. Whether a crashed turn continues by itself is the per-agent `resume.after_crash` setting: `wait` or `continue { max }`. It is a required field with no implicit default, so each deployment decides.
 
 ### Changing configuration
 
@@ -562,10 +607,10 @@ pub enum DrainResult { Quiesced { at: LogOffset }, DeadlineHit { forced: bool },
 
 What happens on `Command::Drain { at, deadline }`:
 
-1. The phase becomes `Draining`. New `Send` commands are still accepted and logged into the inbox, so nothing a user sends is lost, but no new turn starts.
+1. The phase becomes `Draining`. New messages are still accepted, logged and acknowledged, so nothing a sender sends is lost, but no new turn starts.
 2. `drain_requested` is dispatched. Plugins that own background work (jobs, subagents, schedulers) stop admitting new work and report what must finish first. A subagent is itself an agent, so the parent drains its children with the same command.
 3. The driver runs until the requested safe point. A step that is waiting on a tool keeps waiting until the tool finishes or the deadline passes.
-4. At the safe point the driver writes a snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`.
+4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. From this moment the host's ingress appends messages for the agent to its spool instead of a live inbox.
 5. If the deadline passes first, the driver falls back to `Immediate`: it cancels running tool bodies through their child tokens, writes "not run" or "outcome unknown" results the same way crash repair would, and then quiesces. The result reports `DeadlineHit { forced: true }` so the operator knows the stop was not clean.
 
 ```rust
@@ -573,23 +618,121 @@ async fn settle_drain(cx: &mut AgentCtx, here: DrainPoint) -> Result<Option<Exit
     let Phase::Draining { at, deadline, .. } = &cx.phase else { return Ok(None) };
     if !(here.satisfies(*at) || Instant::now() >= *deadline) { return Ok(None); }
 
-    write_snapshot(cx).await?;
+    let snapshot = write_snapshot(cx, Completeness::Full).await?;  // every slot, inbox, seen set
     cx.log.append(Event::Quiesced {
+        snapshot: snapshot.offset,
         at: here,
         suspended_turn: cx.current_turn_if_suspended(),
         inbox_len: cx.inbox.len(),
     })?;
     cx.log.sync().await?;
     cx.log.release_lease().await?;
+    cx.runtime().ingress.route_to_spool(cx.id);   // later messages go to this host's spool
     cx.phase = Phase::Quiesced;
     cx.notify_drain_waiters(DrainResult::Quiesced { at: cx.log.offset() });
     Ok(Some(Exit::Quiesced))
 }
 ```
 
-A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which sees `Tail::Quiesced` and continues any suspended turn with no repair and no user message.
+A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, merges the spool, and continues any suspended turn with no repair and no user message.
 
-**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a snapshot, appends `Parked { waiting_on }`, and its task exits; an `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist.
+**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages that arrive meanwhile go to the spool. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
+
+## Inbound messages
+
+Every message to an agent, from a user, another agent, a scheduler or a webhook, arrives in an envelope:
+
+```rust
+pub struct Envelope {
+    pub agent: AgentId,
+    pub sender: SenderId,
+    pub sent_at: Timestamp,      // assigned once, by the sender or the cluster gateway
+    pub delivery: Delivery,      // NextTurn | NextStep
+    pub body: MessageBody,
+    pub checksum: Digest,        // over a canonical encoding of all fields above
+}
+
+impl Envelope {
+    fn key(&self) -> (Timestamp, Digest) { (self.sent_at, self.checksum) }
+}
+```
+
+Two rules make deduplication work across hosts. The timestamp is assigned before the message is routed, never by the receiving host, so two copies of one message that reach different hosts are identical and have the same checksum. And the checksum covers the sender, the timestamp and the body, so two different messages with the same timestamp still sort deterministically and are not mistaken for each other. A sender that means to send the same text twice at the same instant must make the envelopes differ, for example with a sequence number in the body.
+
+The inbox keeps two structures:
+
+```rust
+pub struct Inbox {
+    pending: BTreeMap<(Timestamp, Digest), Envelope>,  // received, not yet taken into a turn or step
+    seen: SeenSet,                                     // checksums of every envelope received, within the horizon
+    next_step: Vec<Input>,                             // claimed for the current turn's next step
+    newest: Timestamp,                                 // newest sent_at ever received
+}
+
+impl Inbox {
+    /// Called for every envelope, from a live Send, a spool on this host, or a Merge from another host.
+    fn offer(&mut self, env: Envelope, log: &mut SessionLog, cfg: &InboxConfig) -> Offer {
+        if self.seen.contains(&env.checksum) { return Offer::Duplicate; }  // already received: ack, drop
+        if env.sent_at < self.newest - cfg.dedupe_horizon {               // [config]
+            // Too old to prove it is not a duplicate whose record was pruned.
+            return match cfg.late_policy { LatePolicy::Refuse => Offer::Refused, LatePolicy::Admit => self.accept(env, log) };
+        }
+        self.accept(env, log)
+    }
+
+    fn accept(&mut self, env: Envelope, log: &mut SessionLog) -> Offer {
+        log.append(Event::MessageReceived(env.clone()));   // durable before the sender is acknowledged
+        self.seen.insert(env.checksum, env.sent_at);
+        self.newest = self.newest.max(env.sent_at);
+        self.pending.insert(env.key(), env);
+        Offer::Accepted
+    }
+
+    /// The driver takes the earliest pending message for a new turn.
+    fn take_next_turn(&mut self) -> Option<Input> { /* pop first NextTurn entry in key order */ }
+}
+```
+
+Ordering is defined over what has not yet been consumed. Pending messages are always taken in `(timestamp, checksum)` order, so it does not matter which host received a message first or in what order forwarded batches arrive. Once a message has been taken into a turn, its place in the conversation is fixed and logged. A message that arrives after a later-stamped message was already taken is still admitted, at the front of the pending set, and its log record is marked `late`. With the migration sequence below, this happens only to messages that the old host received after the new host was released, which a short forwarding window keeps rare.
+
+The seen set is pruned by timestamp once entries fall outside `dedupe_horizon`, and it is part of every snapshot, so deduplication survives quiesce, crash and migration. Senders are expected to retry until acknowledged, and a host acknowledges only after the envelope is durable in the agent's log or in a spool. Retries plus deduplication give each message exactly one admission.
+
+## Migrating an agent between hosts
+
+Resizing a cluster moves agents by quiescing them on one host and resuming them on another. The orchestrator drives the sequence; the agent's own behavior is unchanged, and nothing the model sees records the move. The sequence below follows the eight steps in the requirements.
+
+| Step | Host A | Host B | Session store |
+|---|---|---|---|
+| 1. Running on A | Agent runs; messages go straight to its inbox | | Epoch `n`, owned by A |
+| 2. Quiesce requested | `Drain { at, deadline }`; messages still logged into the inbox | | |
+| 3. Quiescing and quiesced | Reaches the safe point, writes the complete snapshot and `Quiesced`, releases the lease; later messages go to A's spool | | Unowned; ends with `Quiesced` |
+| 4. Thawed on B | | `resume(id, StartMode::Thawed)`: opens the store, restores the snapshot, appends `Thawed`; phase `Thawed` | Epoch `n+1`, owned by B |
+| 5. Messages arrive at both | Spooled | Offered to the inbox: logged, sorted, deduplicated; no turn runs | |
+| 6. A's messages added to B | Forwards its spool to B as `Merge` batches; deletes each batch only after B acknowledges it | Offers each envelope; duplicates are dropped | |
+| 7. B restarts the agent | Keeps forwarding anything new | `Release`: phase becomes `Idle`; the suspended turn continues, then pending messages run in key order | |
+| 8. A torn down | Stops acknowledging (senders retry against B), forwards its final batch, waits for the acknowledgment, deletes the spool | | |
+
+```rust
+/// Orchestrator side. Each call is idempotent so the whole sequence can be retried.
+async fn migrate(id: AgentId, a: &HostClient, b: &HostClient, cfg: &MigrationConfig) -> Result<(), MigrateError> {
+    a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;          // steps 2-3
+    b.thaw(id).await?;                                                // step 4
+    cfg.directory.point(id, b.host()).await?;                         // step 5 begins as routes update
+    a.start_forwarding(id, b.host()).await?;                          // step 6, continues until teardown
+    a.wait_spool_drained_once(id).await?;                             // everything A held at this point is on B
+    b.release(id).await?;                                             // step 7
+    a.teardown_after(cfg.forward_grace).await?;                       // step 8
+    Ok(())
+}
+```
+
+Three properties make the move transparent.
+
+1. **Nothing is lost.** Every message is durable before it is acknowledged, in A's log, A's spool or B's log, and A deletes spooled messages only after B has made them durable.
+2. **Nothing is admitted twice.** The seen set travels in the quiesce snapshot, so B recognizes messages A had already received, and any message delivered to both hosts or forwarded twice has one checksum.
+3. **Only one host writes.** Opening the store for B raises the epoch, and the store refuses any append that carries an older one. If A were still running because of a bug or a partition, its writes would fail rather than fork the log. The same fencing covers a failed move: if B dies while thawed, the orchestrator thaws the agent on another host, which raises the epoch again, and A's forwarding target changes with the directory.
+
+Waiting for A's spool to drain once before releasing B means everything that arrived during the quiesce window is sorted before B runs anything. Messages that reach A after that are still delivered, as late arrivals, until A is torn down.
 
 ## Isolation in a multi-tenant process
 
@@ -683,6 +826,10 @@ code.inline = { command = ["globex-crm-mcp"], tools = ["lookup_customer", "open_
 
 [resume]
 after_crash = "wait"
+
+[inbox]
+dedupe_horizon = "24h"
+late_policy = "refuse"
 ```
 
 What the loop does with B's Python plugin:
@@ -693,14 +840,22 @@ What the loop does with B's Python plugin:
 - On `snapshot`, the Python code returns its own state as JSON, which goes into B's snapshot record. On resume, a new child process receives it before any events are replayed.
 - If the Python process dies, the runner reports a `PluginError` on the next hook, which fails B's current turn; A is unaffected.
 
-## Open questions
+## Decisions and open questions
 
-1. **Default after a crash.** This proposal defaults to waiting for the user, as DeepSeek and Grok do, with opt-in continuation for unattended agents. A per-tenant default may be more useful.
-2. **Derived versus snapshotted state.** Deriving every slot from the log keeps snapshots small and correct by construction but makes resume slower on long sessions. The proposal allows both; the question is which to prefer for built-in plugins.
-3. **One hook protocol for WASM and processes.** A WIT world with a generated JSON-RPC schema is the suggestion. The alternative is two protocols with a conformance test suite.
-4. **Process per agent or per tenant for `process` plugins.** Per agent is stronger and costs more memory; per tenant is cheaper but means one tenant's agents share an interpreter.
-5. **Approval while draining.** If a drain reaches a step that is parked on a human answer, the proposal quiesces it as parked. Whether the drain deadline should instead deny the pending request is a policy call.
-6. **Store backends.** JSONL files with an OS lock (DeepSeek) are simple for one host; SQLite or an object store needs a lease protocol for multi-host deployments.
+Decided after review of the first draft:
+
+1. **Behavior after a crash is configuration.** `resume.after_crash` is a required per-agent field, `wait` or `continue { max }`, with no implicit default.
+2. **Crash resume replays the log; quiesce resume does not.** Periodic snapshots are optional and off by default, since a slower resume after a crash is acceptable. The quiesce snapshot is complete, so a quiesced agent is rebuilt from it plus the messages that arrived while it was quiesced.
+3. **One hook definition for every non-Rust runner.** The hooks are defined once as WIT, and the JSON-RPC schema for `process` runners and the Rust bindings are generated from it.
+4. **`process` plugins run one process per agent.**
+5. **A drain does not deny pending approvals.** A parked agent stays parked through a quiesce or a move, and the request is still waiting when it resumes.
+6. **Storage backends are configurable** through the `SessionStore` plugin, per agent.
+
+Still open:
+
+1. **Late arrivals.** The default for `late_policy` (refuse or admit) and the length of `dedupe_horizon`. Refusing is safer against duplicates; admitting is safer against loss when a host was partitioned for longer than the horizon.
+2. **Where timestamps come from.** Sender clocks are simplest, but skew between senders changes the order in which their messages are taken. A cluster gateway that stamps every message gives one clock, at the cost of a component every message must pass through.
+3. **Telling the model about late messages.** A late message is logged with a `late` flag. Whether the request builder should show that to the model, for example as "this message was sent before your last reply", is a prompt-design question.
 
 ## What this borrows
 
@@ -715,4 +870,5 @@ What the loop does with B's Python plugin:
 | Sequential preparation of tool calls, parallel execution, typed stop outcomes | Grok Build |
 | Hard caps on steps and forced continuations | Grok Build (forced continuations), opencode (steps) |
 | Session actor that owns its state and takes commands over a channel | Grok Build |
-| Runner and code split, immutable plugin instances, state slots, drain and park phases | New in this proposal |
+| Runner and code split, immutable plugin instances, state slots, drain, park and thaw phases | New in this proposal |
+| Sender-stamped envelopes sorted and deduplicated by `(timestamp, checksum)`, host spools, epoch fencing for moves between hosts | New in this proposal |
