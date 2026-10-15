@@ -51,7 +51,7 @@ A new agent's context comes from a provisioner plugin. The provisioner is the on
 | Everything is a plugin | The driver, model, store, tools and all policy are plugins behind service kinds and hooks ([Runners and code](#runners-and-code), [Hooks](#hooks)). Swapping the driver swaps the loop. |
 | Written in Rust | Runner and plugin interfaces are Rust traits; the agent is a single-owner task, so the context needs no locks ([The agent context](#the-agent-context)). |
 | Checkpoint and resume | A serializable context that quiesce turns into an image and thaw restores; write-ahead save points and log replay for crashes ([Checkpoint and resume](#checkpoint-and-resume), [Quiesce](#quiesce-and-graceful-shutdown)). |
-| Many agents per process, configured independently, strictly isolated, all state in a context variable | One `AgentCtx` per agent holding all mutable state; immutable plugin instances; per-agent capability grants and quotas; isolation level chosen per runner kind ([Isolation](#isolation-in-a-multi-tenant-process)). |
+| Many agents per process, configured independently, strictly isolated, all state in a context variable | One `AgentCtx` per agent holding all mutable state; immutable plugin instances; per-agent capability grants and quotas; isolation level chosen per runner ([Isolation](#isolation-in-a-multi-tenant-process)). |
 | Plugins are a runner plus code | `Runner::load(code) -> Plugin` with code being configuration, a WASM component, or an external program ([Runners and code](#runners-and-code)). |
 | Move agents between hosts transparently when resizing a cluster | Messages wait in a shared queue plugin; quiesce produces an image on the old host and thaw restores it on the new one ([Message queue](#message-queue), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
 | Initial configuration is also a plugin | A provisioner plugin, named in the process's startup file, produces each new agent's configuration and initial state ([Creating an agent](#creating-an-agent)). |
@@ -61,7 +61,7 @@ A new agent's context comes from a provisioner plugin. The provisioner is the on
 - **Runtime**: the per-process host. Holds the runner registry, the scheduler, the log store and the provisioner. Shared by all agents, never mutated by them.
 - **Agent**: one configured conversation partner with its own session log. Owned by exactly one task.
 - **AgentCtx**: the struct that holds all of one agent's mutable state. The "context variable" from the requirements.
-- **Runner**: a Rust type implementing `Runner`, registered once per process under a kind name such as `builtin.compaction` or `wasm`.
+- **Runner**: a Rust type implementing `Runner`, registered once per process under a runner name such as `builtin.compaction` or `wasm`. An agent's config picks the runner for each plugin by that name.
 - **Code**: what a runner loads for one plugin: an inline config table, a file, or a versioned package, always pinned by digest.
 - **Plugin instance**: what `Runner::load` returns for one agent. Immutable after load.
 - **State slot**: the mutable, serializable state of one plugin instance, stored in `AgentCtx`.
@@ -80,7 +80,7 @@ A new agent's context comes from a provisioner plugin. The provisioner is the on
 ```text
 process
 └── Runtime (shared, immutable after start)
-    ├── RunnerRegistry: kind -> Arc<dyn Runner>
+    ├── RunnerRegistry: runner name -> Arc<dyn Runner>
     ├── LogStore:       runtime-level plugin; where every agent's session log lives (any backend)
     ├── Scheduler:      per-tenant quotas, admission, fair sharing of model/tool slots
     ├── Provisioner:    runtime-level plugin; creates new agents' configs and initial state
@@ -160,12 +160,10 @@ Three properties follow from this layout.
 ## Runners and code
 
 ```rust
-/// Compiled into the host. Registered once per process; shared by every agent.
+/// Compiled into the host. Registered once per process under a runner name, e.g.
+/// `registry.register("wasm", WasmRunner::new())`; shared by every agent.
 /// Holds only immutable, tenant-neutral resources (a WASM engine, a parser).
 pub trait Runner: Send + Sync + 'static {
-    /// Kind name used in agent config, e.g. "builtin.react-driver", "wasm", "process.python".
-    fn kind(&self) -> RunnerKind;
-
     /// Version of the state-slot format this runner writes. Bumped on incompatible change.
     fn state_version(&self) -> u32;
 
@@ -244,11 +242,11 @@ pub trait MessageQueue: Plugin {
 
 The `Provisioner` trait is described in [Creating an agent](#creating-an-agent). `LogStore` and `Provisioner` are the two runtime-level services: their plugins are named in the process's startup file instead of in an agent's config, because they are part of the hosting infrastructure and are needed before any agent exists.
 
-### Runner kinds
+### Runners
 
-The runner kind decides what "code" means and how strongly that code is isolated. Proposed initial set:
+The runner decides what "code" means and how strongly that code is isolated. Proposed initial set:
 
-| Runner kind | Code | Where the code runs | Isolation |
+| Runner name | Code | Where the code runs | Isolation |
 |---|---|---|---|
 | `builtin.*` (one runner per feature: `builtin.react-driver`, `builtin.compaction`, `builtin.tool.bash`, `builtin.model.openai-compat`, ...) | Inline TOML table, validated against the runner's config schema | In the host, as compiled Rust | Trusted code; isolation comes from the context and grants |
 | `wasm` | A WASM component implementing a WIT world that mirrors the `Plugin` hooks | In the host, one WASM instance per plugin per agent | Separate linear memory, fuel and memory limits per instance, host calls only through grants |
@@ -499,7 +497,7 @@ An agent is restored in one of two ways, depending on whether it stopped cleanly
 pub struct AgentImage {
     pub id: AgentId,
     pub tenant: TenantId,
-    pub config: AgentConfig,                       // every plugin: runner kind, code digest, grants
+    pub config: AgentConfig,                       // every plugin: runner name, code digest, grants
     pub slots: Vec<(PluginId, u32, StateBlob)>,    // every slot, with its runner's state_version
     pub history: History,                          // what the next model request is built from
     pub inbox: Inbox,                              // pulled and logged, not yet used
@@ -515,7 +513,7 @@ Plugins with state outside a slot, such as a Python application in its own proce
 
 The log is the durable record used for crash recovery and for audit. It lives in the runtime's `LogStore`, which is hosting infrastructure: configured once per process, the same for every tenant, and not necessarily on the local machine. Any host can therefore open any agent's log by its id. It holds:
 
-1. **A header** written once at creation from the provisioner's output: agent id, tenant, the full `AgentConfig` with every runner kind, code digest and grant, and each runner's `state_version`.
+1. **A header** written once at creation from the provisioner's output: agent id, tenant, the full `AgentConfig` with every runner name, code digest and grant, and each runner's `state_version`.
 2. **Events**: messages pulled from the queue (with their queue ids and send times), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations, and `Quiesced` and `Thawed` markers.
 3. **Periodic snapshots**, optional and off by default (`[config] snapshot.every_steps`), which only shorten crash recovery. Plugins whose state can be derived from events mark their slot `derived` and rebuild it in `replay`.
 
@@ -540,7 +538,7 @@ pub async fn thaw(rt: &Runtime, image: AgentImage) -> Result<AgentHandle, ThawEr
     //    Refuses if the log has moved past the image: the image is out of date.
     let log = rt.log_store.open(&image.id, OpenMode::ContinueFrom(image.log_position)).await?;
 
-    // 2. Rebuild plugins from the config in the image. A missing runner kind or a
+    // 2. Rebuild plugins from the config in the image. A missing runner name or a
     //    digest mismatch fails loud; nothing silently falls back.
     let mut cx = AgentCtx::build(rt, &image.config, log).await?;
 
@@ -815,7 +813,7 @@ Isolation has four layers, from the language up to the operating system.
 
 **Faults and resources.** Each agent task runs under `catch_unwind` at its top level; a panic in a plugin fails that agent, writes a crash marker if possible, and leaves the process and other agents running. Model calls and tool bodies acquire slots from the tenant's `QuotaHandle`, so one tenant cannot starve the rest. WASM plugins run with per-instance fuel and memory limits. A quota breach pauses or fails the agent; it never aborts the process.
 
-**Code.** The runner kind decides how far untrusted code is from the host:
+**Code.** The runner decides how far untrusted code is from the host:
 
 - `builtin` code is trusted Rust, configured by data. It is as isolated as the context and grants make it.
 - `wasm` code runs in the host but in its own linear memory, one instance per plugin per agent. This is the preferred way to run tenant-supplied code in-process.
