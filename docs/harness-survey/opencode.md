@@ -113,7 +113,7 @@ The loop is not an in-memory tool loop. **Each step is one `llm.stream` call tha
 
 **Interruption** uses Effect fiber interruption. `POST /interrupt` stops the locally owned chain. Pending inbox items survive.
 
-**Crash recovery.** A write-ahead execution claim is persisted when a busy period starts. At startup, top-level sessions that still hold a claim are resumed with bounded attempts (`core/src/session/execution/restart.ts`; `specs/v2/session.md`). The spec states this gives no exactly-once guarantee.
+**Crash recovery.** A write-ahead execution claim is persisted when a busy period starts. At startup, top-level sessions that still hold a claim are resumed with bounded attempts (`core/src/session/execution/restart.ts`; `specs/v2/session.md`). Each resume adds a "The server restarted while you were working" message and continues the turn without user input; a turn resumed more than 10 times is failed instead. Tools left running are marked failed with "Tool execution interrupted", never re-run. The spec states this gives no exactly-once guarantee. See [Crash Recovery](../crash-recovery/README.md#opencode).
 
 ## 5. Model and provider layer
 
@@ -243,7 +243,7 @@ There is no todo or todowrite tool in V2. A grep of `core/src/tool` and `core/sr
 - File permissions are restricted to the owner (`database/database.ts:85`).
 
 **Event-sourced.**
-- Durable events go to the `event` table, keyed by `(aggregate_id, seq)` (`core/src/event/sql.ts`).
+- Each durable event commits in one SQLite transaction that runs the projectors and advances `event_sequence` (`core/src/bus.ts:315-433`). The raw event row is also written to the `event` table, keyed by `(aggregate_id, seq)` (`core/src/event/sql.ts`), only when `events.persist` is on. It is off by default on the Node server and forced on in workerd (`bus.ts:203`, `server/src/routes.ts:119`, `server/src/workerd.ts:69`).
 - **Projectors** (`session/projector.ts`, 810 LOC) fold events transactionally into read models: `session`, `session_message`, `session_inbox`, `session_pending`, `instruction_*` (`session/sql.ts`).
 - `AGENTS.md` sets the rule: "record irreducible new facts … Enrich projections."
 - Live-only deltas (text, reasoning, tool-input) are not replayed.

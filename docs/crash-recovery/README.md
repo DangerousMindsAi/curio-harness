@@ -109,12 +109,6 @@ This is the most deliberate design of the three: because the tool-started record
 
 **Tests.** Repair of dangling tool calls (`xai-chat-state/src/actor/tests.rs:2245`, `:2410`), torn lines (`xai-grok-shell/src/session/storage/jsonl/tests.rs:2094-2339`) and orphaned subagents (`xai-grok-shell/src/agent/subagent/tests/rest.rs:1420`). There is no test for the interrupted-turn check itself and none that kills the agent mid-turn.
 
-## Corrections to the survey
-
-- **opencode:** the survey says durable events go to the `event` table. The projections (session and message tables) are always written, but the raw event row is written only when `events.persist` is on, which is off by default on the Node server and forced on in workerd (`bus.ts:203`, `packages/server/src/routes.ts:119`, `packages/server/src/workerd.ts:69`). Recovery reads the projections, so it works either way. The survey's "resumes crashed runs at startup" is right, and it should add that interrupted tools are failed, never re-run.
-- **DeepSeek Harness:** the survey's account is right. It should add that resume is not automatic: the interrupted turn is closed and the session waits for input.
-- **Grok Build:** the survey says `updates.jsonl` is authoritative for restore. The model's conversation is actually loaded from `chat_history.jsonl`, which is rebuilt from `updates.jsonl` only when missing or empty. The survey also lists the subagent attempt store as a feature; it is unused code ("no code calls this module yet", `xai-grok-shell/src/agent/subagent/attempt_store/mod.rs:1-22`). The durable rewind mirror is off by default and not yet used for restoring.
-
 ## Notes for curio-harness
 
 1. **Decide early whether a crashed turn continues by itself.** opencode's automatic resume is convenient for long unattended runs and needs two safeguards it already has: a cap on resumes per turn, and certainty that only one process resumes a session. DeepSeek and Grok avoid both problems by waiting for the user, at the cost of stalling unattended work. A middle path is to resume automatically only for sessions started in an unattended mode.
