@@ -14,3 +14,5 @@ Each per-harness report follows the same outline (identity, layout, process topo
 | [DangerousMindsAi/opencode](https://github.com/DangerousMindsAi/opencode) | `8ffbcc2` | 2026-10-14 |
 | [DangerousMindsAi/deepseek-harness](https://github.com/DangerousMindsAi/deepseek-harness) | `d743267` | 2026-10-09 |
 | [DangerousMindsAi/grok-build](https://github.com/DangerousMindsAi/grok-build) | `2bdd1d6` | 2026-09-29 |
+
+For a closer look at one subsystem, see [Agent Loops](../agent-loops/README.md): pseudo-code, configuration and plugin hooks for each harness's core loop.
