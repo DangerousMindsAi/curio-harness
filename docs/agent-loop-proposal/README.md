@@ -20,8 +20,9 @@ This builds on the [architecture survey](../harness-survey/README.md), the [agen
 - [The loop](#the-loop)
 - [Checkpoint and resume](#checkpoint-and-resume)
 - [Quiesce and graceful shutdown](#quiesce-and-graceful-shutdown)
-- [Inbound messages](#inbound-messages)
+- [Message queue](#message-queue)
 - [Migrating an agent between hosts](#migrating-an-agent-between-hosts)
+- [Creating an agent](#creating-an-agent)
 - [Isolation in a multi-tenant process](#isolation-in-a-multi-tenant-process)
 - [Worked example](#worked-example)
 - [Decisions and open questions](#decisions-and-open-questions)
@@ -29,7 +30,7 @@ This builds on the [architecture survey](../harness-survey/README.md), the [agen
 
 ## Summary
 
-The process hosts a `Runtime` that holds only shared, immutable machinery: a registry of runners, storage backends and a scheduler. Each agent is one async task that exclusively owns an `AgentCtx`, and every piece of per-agent state lives in that struct. Nothing per-agent is reachable through a global, a static, or a task-local.
+The process hosts a `Runtime` that holds only shared, immutable machinery: a registry of runners, storage backends, a scheduler and the provisioner plugin. Each agent is one async task that exclusively owns an `AgentCtx`, and every piece of per-agent state lives in that struct. Nothing per-agent is reachable through a global, a static, or a task-local.
 
 Every behavior is a plugin, including the loop driver, the model provider, the session store and each tool. A plugin is a pair: a **runner**, which is Rust code compiled into the host and implementing the `Runner` trait, and **code**, which is whatever the runner interprets. For a built-in runner the code is a block of configuration; for a WASM or Python runner it is a whole program. Runners are shared by every agent in the process and hold no agent state. Loading code through a runner produces a plugin instance that is immutable after load; its mutable state lives in a typed slot in the agent's context. This split is what makes checkpointing uniform and isolation checkable: the harness can serialize every slot without trusting each plugin to remember to, and a plugin has nowhere else to keep state.
 
@@ -39,7 +40,9 @@ Checkpointing is event-sourced. The log is forced to disk before every model req
 
 Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), writes a complete snapshot and a `Quiesced` marker, and releases the session. A quiesced agent resumes exactly where it stopped, from the snapshot alone, with no replay, no repair and no user message needed. None of the three surveyed harnesses can do this.
 
-Quiesce is also how agents move between hosts when a cluster is resized. Every inbound message carries a sender-assigned timestamp and a checksum; the agent keeps pending messages sorted by that pair and drops duplicates, so messages that arrive while the agent is quiesced, arrive at both the old and the new host, or are forwarded twice are all admitted exactly once and in the same order. Messages always land first in a durable per-agent mailbox that lives outside the agent's context, so the same path serves a running agent, a quiesced one and one in the middle of a move. A fencing epoch on the session store guarantees that only one host can write to the agent at a time. The move is invisible to senders.
+Inbound messages wait in a shared message queue, which is itself a plugin. An agent pulls from its queue only when it is ready to use a message, so a quiesced agent simply stops pulling and anything sent meanwhile stays in the queue. That makes moving an agent between hosts, when a cluster is resized, a quiesce on the old host followed by a resume on the new one. A fencing epoch on the session store guarantees that only one host can write to the agent at a time.
+
+A new agent's context comes from a provisioner plugin. The provisioner is the one plugin configured outside any agent, in the process's own startup file; given a request to create an agent, it returns the agent's configuration and initial state. From then on the agent is rebuilt from its own log and never asks the provisioner again.
 
 ## Requirements and where each is met
 
@@ -50,25 +53,25 @@ Quiesce is also how agents move between hosts when a cluster is resized. Every i
 | Checkpoint and resume | Write-ahead save points, snapshots of state slots at step boundaries, and a resume procedure that replays and repairs ([Checkpoint and resume](#checkpoint-and-resume)). Graceful quiesce is covered in its own section. |
 | Many agents per process, configured independently, strictly isolated, all state in a context variable | One `AgentCtx` per agent holding all mutable state; immutable plugin instances; per-agent capability grants and quotas; isolation level chosen per runner kind ([Isolation](#isolation-in-a-multi-tenant-process)). |
 | Plugins are a runner plus code | `Runner::load(code) -> Plugin` with code being configuration, a WASM component, or an external program ([Runners and code](#runners-and-code)). |
-| Move agents between hosts transparently when resizing a cluster | Quiesce, thaw on the new host, forward messages from the old host, deduplicate and sort, then resume ([Inbound messages](#inbound-messages), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
+| Move agents between hosts transparently when resizing a cluster | Messages wait in a shared queue plugin; quiesce on the old host, resume on the new one ([Message queue](#message-queue), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
+| Initial configuration is also a plugin | A provisioner plugin, named in the process's startup file, produces each new agent's configuration and initial state ([Creating an agent](#creating-an-agent)). |
 
 ## Vocabulary
 
-- **Runtime**: the per-process host. Holds the runner registry, storage backends and the scheduler. Shared by all agents, never mutated by them.
+- **Runtime**: the per-process host. Holds the runner registry, storage backends, the scheduler and the provisioner. Shared by all agents, never mutated by them.
 - **Agent**: one configured conversation partner with its own session log. Owned by exactly one task.
 - **AgentCtx**: the struct that holds all of one agent's mutable state. The "context variable" from the requirements.
 - **Runner**: a Rust type implementing `Runner`, registered once per process under a kind name such as `builtin.compaction` or `wasm`.
 - **Code**: what a runner loads for one plugin: an inline config table, a file, or a versioned package, always pinned by digest.
 - **Plugin instance**: what `Runner::load` returns for one agent. Immutable after load.
 - **State slot**: the mutable, serializable state of one plugin instance, stored in `AgentCtx`.
-- **Service**: a capability with exactly one provider per agent (`Driver`, `Model`, `SessionStore`, `Approval`) or many (`Tool(name)`).
+- **Service**: a capability with exactly one provider per agent (`Driver`, `Model`, `SessionStore`, `MessageQueue`, `Approval`) or many (`Tool(name)`).
 - **Hook**: a typed interception point the driver or tool pipeline dispatches to every subscribed plugin, in order.
 - **Turn / step / attempt**: as in DeepSeek. A turn answers one input; a step is one model request plus its tools; an attempt is one try at the request.
 - **Safe point**: a moment where the agent's state is consistent and can be snapshotted or quiesced: before a step starts, or after a turn ends.
-- **Envelope**: the wrapper on every inbound message, carrying a sender-assigned timestamp and a checksum. The pair `(timestamp, checksum)` is the message's sort key, and the checksum is its identity for deduplication.
-- **Mailbox**: a durable, append-only queue of envelopes that a host keeps for each agent it receives messages for. Every inbound message is appended there first, whether the agent is running, quiesced or gone. Appending needs no lease, and the mailbox is not part of `AgentCtx`.
+- **Message queue**: the service an agent's inbound messages wait in until the agent pulls them. Provided by a plugin, so the backend (a shared broker, a database table, an in-process channel for tests) is configuration.
+- **Provisioner**: the plugin that produces a new agent's configuration and initial state. The only plugin that is configured per process instead of per agent.
 - **Epoch**: a counter on the agent's session store that increases each time a host takes ownership. Writes carrying an older epoch are refused.
-- **Thaw**: loading a quiesced agent's snapshot on a host and taking ownership, without starting to run it.
 
 ## Process layout
 
@@ -78,8 +81,7 @@ process
     ├── RunnerRegistry: kind -> Arc<dyn Runner>
     ├── StoreBackends:  where session logs live (files, SQLite, object store)
     ├── Scheduler:      per-tenant quotas, admission, fair sharing of model/tool slots
-    ├── Ingress:        receives envelopes, appends each to the agent's mailbox, rings its doorbell
-    ├── Mailboxes:      AgentId -> durable mailbox (backend configurable); one consumer each
+    ├── Provisioner:    the one runtime-level plugin; creates agent configs, locates agent logs
     └── agents: AgentId -> AgentHandle      (a channel sender, no state)
 
 agent task (one per live agent, owns everything below)
@@ -88,8 +90,9 @@ agent task (one per live agent, owns everything below)
     ├── plugins         immutable instances, in hook order, plus a service index
     ├── state           one slot per plugin
     ├── log             append-only session log (via the SessionStore plugin)
-    ├── inbox           pending envelopes sorted by (timestamp, checksum), seen set, next_turn / next_step
-    ├── phase           Idle | Running | Draining | Parked | Quiesced | Thawed | Closed
+    ├── inbox           messages pulled from the queue and not yet used; next_turn / next_step
+    ├── queue           this agent's consumer on its message queue (via the MessageQueue plugin)
+    ├── phase           Idle | Running | Draining | Parked | Quiesced | Closed
     ├── counters        steps, turns, forced continuations, tokens
     ├── grants          what this agent may touch (fs roots, hosts, secrets, services)
     └── cancel, quota   cancellation token, tenant quota handle
@@ -99,18 +102,16 @@ Outside callers talk to an agent only through its `AgentHandle`:
 
 ```rust
 pub enum Command {
-    Mail,                                            // doorbell: the mailbox has new envelopes
     Cancel { reason: CancelReason },                 // abort the current turn
     Drain { at: DrainPoint, deadline: Instant, reply: oneshot::Sender<DrainResult> },
     Answer { request: RequestId, answer: Answer },   // approval or question from a plugin
     Reconfigure { patch: ConfigPatch },              // applied at the next safe point
-    Release,                                         // leave Thawed and start running
 }
 
 pub struct AgentHandle { tx: mpsc::Sender<Command>, id: AgentId, tenant: TenantId }
 ```
 
-The agent task is an actor. Commands are drained at defined points in the loop, so nothing outside the task ever holds a reference into `AgentCtx`.
+The agent task is an actor. Commands are drained at defined points in the loop, so nothing outside the task ever holds a reference into `AgentCtx`. Messages for the model do not travel as commands; they go through the agent's message queue.
 
 ## The agent context
 
@@ -123,7 +124,8 @@ pub struct AgentCtx {
     plugins: PluginTable,            // Box<dyn Plugin> in hook order + service index
     state: StateSlots,               // PluginId -> Box<dyn PluginState>
     log: SessionLog,                 // append, sync, read; backed by the SessionStore service
-    inbox: Inbox,                    // sorted, deduplicated pending set; admission is a log event
+    inbox: Inbox,                    // pulled, logged and acknowledged, not yet used by a turn or step
+    queue: QueueConsumer,            // exclusive consumer of this agent's queue
     phase: Phase,
     counters: Counters,              // derived from the log; cached here
     grants: Grants,                  // capabilities granted by config, per plugin
@@ -137,8 +139,7 @@ pub enum Phase {
     Running { turn: TurnId },
     Draining { at: DrainPoint, deadline: Instant, waiters: Vec<oneshot::Sender<DrainResult>> },
     Parked { waiting_on: RequestId },  // e.g. a human approval; may be evicted from memory
-    Quiesced,                          // snapshot written, lease released; task has exited
-    Thawed { epoch: Epoch },           // loaded and owned on this host, accepting messages, not running
+    Quiesced,                          // snapshot written, lease released, queue detached; task has exited
     Closed,
 }
 
@@ -228,7 +229,14 @@ pub trait Tool: Plugin {
 pub trait SessionStore: Plugin {
     async fn open(&self, id: &SessionId, lease: LeaseMode) -> Result<StoreHandle, StoreError>;
 }
+
+pub trait MessageQueue: Plugin {
+    /// Become the only consumer of this agent's queue; see Message queue.
+    async fn attach(&self, agent: &AgentId) -> Result<QueueConsumer, QueueError>;
+}
 ```
+
+The `Provisioner` trait is described in [Creating an agent](#creating-an-agent).
 
 ### Runner kinds
 
@@ -290,23 +298,19 @@ This is the default `Driver` plugin, `builtin.react-driver`. Lines marked `// [h
 async fn run(&self, cx: &mut AgentCtx) -> Result<Exit, DriverError> {
     dispatch(cx, Hook::AgentLoaded).await?;                       // [hook] agent_loaded
     loop {
-        cx.apply_pending_commands()?;          // Mail, Cancel, Drain, Answer, Reconfigure, Release
-
-        // Thawed: owned on this host and accepting messages, but not running until Release.
-        if let Phase::Thawed { .. } = cx.phase {
-            cx.wait_for_command().await;
-            continue;
-        }
+        cx.apply_pending_commands()?;          // Cancel, Drain, Answer, Reconfigure
 
         // Safe point: between turns.
         if let Some(exit) = settle_drain(cx, DrainPoint::Turn).await? {
             return Ok(exit);                   // Quiesced or Closed
         }
 
+        if cx.inbox.is_empty() {
+            pull_messages(cx, Pull::Wait).await?;  // idle: wait for a message or a command
+        }
         let Some(input) = cx.inbox.take_next_turn() else {
             cx.phase = Phase::Idle;
-            cx.wait_for_command().await;       // a Send, Drain or Cancel wakes the agent
-            continue;
+            continue;                          // woken by a command, not a message
         };
 
         cx.phase = Phase::Running { turn: TurnId::new() };
@@ -336,7 +340,8 @@ async fn run_turn(cx: &mut AgentCtx, input: Input) -> Result<TurnEnd, DriverErro
             break TurnEnd::StepLimit;
         }
 
-        let mut step = StepInput::from(cx.inbox.take_next_step());   // logged on enqueue
+        pull_messages(cx, Pull::NoWait).await?;                       // steering sent during the last step
+        let mut step = StepInput::from(cx.inbox.take_next_step());   // logged on pull
         match dispatch(cx, Hook::PreStep(&mut step)).await? {         // [hook] pre_step
             Flow::Reject(why) => break TurnEnd::Blocked(why),
             _ => {}
@@ -474,14 +479,14 @@ A turn ends when the model answers without tool calls, a tool concludes the turn
 
 The session log is the source of truth. It holds three kinds of record:
 
-1. **A header** written once at creation: agent id, tenant, the full `AgentConfig` with every runner kind, code digest and grant, and each runner's `state_version`.
-2. **Events**: message admissions (each with its envelope's timestamp and checksum), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations.
-3. **Snapshots**: at a safe point, one record holding state slots (serialized with each runner's format and version), the inbox with its seen set, the counters, and the log offset it covers.
+1. **A header** written once at creation from the provisioner's output: agent id, tenant, the full `AgentConfig` with every runner kind, code digest and grant, and each runner's `state_version`.
+2. **Events**: messages pulled from the queue (with their queue ids), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations.
+3. **Snapshots**: at a safe point, one record holding state slots (serialized with each runner's format and version), the inbox, the counters, and the log offset it covers.
 
 There are two kinds of snapshot, because crash recovery and quiesce have different needs.
 
 - **Periodic snapshots** are optional and off by default (`[config] snapshot.every_steps`). Crash recovery replays the log from the start, or from the last periodic snapshot if there is one, and a little extra time on resume after a crash is acceptable. Plugins whose state can be derived from events (retry counters, repeat counters) mark their slot `derived` and rebuild it in `replay`, so a periodic snapshot may leave those slots out.
-- **The quiesce snapshot** is complete. It holds every slot, derived ones included, plus the full inbox and seen set, so resuming from it needs no replay at all. The only new input on resume is whatever messages arrived while the agent was quiesced. Plugins with opaque state, such as a Python application, contribute a blob through the `snapshot` hook in both kinds.
+- **The quiesce snapshot** is complete. It holds every slot, derived ones included, plus the full inbox, so resuming from it needs no replay at all. Messages sent while the agent was quiesced are still in the queue and are pulled normally once it runs again. Plugins with opaque state, such as a Python application, contribute a blob through the `snapshot` hook in both kinds.
 
 ### When it is forced to disk
 
@@ -490,24 +495,25 @@ There are two kinds of snapshot, because crash recovery and quiesce have differe
 | Before each model request | The request can be rebuilt exactly; a crash during streaming loses only the partial reply |
 | Before each tool body (`ToolStarted`) | Resume can tell "might have run" from "never ran" ([crash recovery note 2](../crash-recovery/README.md#notes-for-curio-harness)) |
 | End of each turn | A finished turn is never lost |
-| Mailbox append, and before each mailbox truncate | A message the sender has been told was received is never lost |
+| After pulling messages, before acknowledging them to the queue | A message leaves the queue only once it is in the agent's log |
 | At quiesce | The agent can be resumed from the snapshot with no replay or repair |
 
-Between save points the `SessionStore` plugin may batch writes. Periodic snapshots are an optimization for crash-resume time and never needed for correctness: resume from the header and the full event stream gives the same context. The quiesce snapshot is the exception, since a thawed agent is built from it directly.
+Between save points the `SessionStore` plugin may batch writes. Periodic snapshots are an optimization for crash-resume time and never needed for correctness: resume from the header and the full event stream gives the same context. The quiesce snapshot is the exception, since a quiesced agent is rebuilt from it directly.
 
-Storage is configurable per agent: the `SessionStore` is a plugin, so the backend (local JSONL files, SQLite, an object store) is chosen in the agent's config. Moving an agent between hosts needs the new host to reach the same log, which means either a shared backend or a store plugin that ships the log with the quiesce snapshot.
+Storage is configurable per agent: the `SessionStore` is a plugin, so the backend (local JSONL files, SQLite, an object store) is chosen in the agent's config. Moving an agent between hosts needs the new host to reach the same log, which means either a shared backend or a store plugin that ships the log with the quiesce snapshot. The provisioner's `locate` tells a host where an agent's log is ([Creating an agent](#creating-an-agent)).
 
 ### Resume
 
 ```rust
-/// Take ownership of an agent on this host. Used after a crash, after a
-/// local quiesce, and as the thaw step of a move between hosts.
-pub async fn resume(rt: &Runtime, id: AgentId, start: StartMode)
+/// Take ownership of an existing agent on this host and start it. Used after a
+/// crash, after a quiesce on this host, and as the second half of a move.
+pub async fn resume(rt: &Runtime, id: AgentId)
     -> Result<AgentHandle, ResumeError>
 {
     // 1. Exclusive ownership. Opening bumps the store's epoch; every later write
     //    carries it, and the store refuses writes from any older epoch.
-    let store = rt.store_for(&id).open(&id, LeaseMode::Exclusive).await?;
+    let locator = rt.provisioner.locate(&id).await?;                 // where the log lives
+    let store = rt.open_store(&locator, LeaseMode::Exclusive).await?;
     let header = store.read_header().await?;
 
     // 2. Rebuild plugins from the recorded config. A missing runner kind or a
@@ -518,9 +524,9 @@ pub async fn resume(rt: &Runtime, id: AgentId, start: StartMode)
         // Fast path: the log ends with a quiesce marker and a complete snapshot.
         Some(Marker::Quiesced { snapshot, suspended_turn }) => {
             restore_slots(rt, &mut cx, &header, &snapshot, Completeness::Full)?;
-            cx.inbox = snapshot.inbox;               // pending messages and seen set
+            cx.inbox = snapshot.inbox;               // pulled but not yet used
             cx.counters = snapshot.counters;
-            cx.log.append(Event::Thawed { host: rt.host_id(), epoch: cx.log.epoch() })?;
+            cx.log.append(Event::Resumed { host: rt.host_id(), epoch: cx.log.epoch() })?;
             if let Some(turn) = suspended_turn { cx.inbox.resume_turn(turn); }
         }
 
@@ -547,17 +553,12 @@ pub async fn resume(rt: &Runtime, id: AgentId, start: StartMode)
         }
     }
 
-    // 3. Become the consumer of this host's mailbox for the agent, and take in what
-    //    arrived while it was not running here: the same call a running agent makes.
-    cx.mailbox = rt.mailboxes.attach(&id, Consumer::Agent).await?;
-    consume_mailbox(&mut cx).await?;
+    // 3. Become the consumer of the agent's queue. Messages sent while it was
+    //    quiesced or crashed are waiting there and are pulled by the driver as usual.
+    cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&id).await?;
     cx.log.sync().await?;
 
-    // 4. Run now, or stay thawed (owned, accepting messages, not running) until Release.
-    cx.phase = match start {
-        StartMode::Run => Phase::Idle,
-        StartMode::Thawed => Phase::Thawed { epoch: cx.log.epoch() },
-    };
+    cx.phase = Phase::Idle;
     Ok(rt.spawn_agent(cx))   // the Driver plugin's run() takes over
 }
 
@@ -606,10 +607,10 @@ pub enum DrainResult { Quiesced { at: LogOffset }, DeadlineHit { forced: bool },
 
 What happens on `Command::Drain { at, deadline }`:
 
-1. The phase becomes `Draining`. New messages are still accepted, logged and acknowledged, so nothing a sender sends is lost, but no new turn starts.
+1. The phase becomes `Draining`. The agent stops pulling from its queue, so new messages wait there, and no new turn starts.
 2. `drain_requested` is dispatched. Plugins that own background work (jobs, subagents, schedulers) stop admitting new work and report what must finish first. A subagent is itself an agent, so the parent drains its children with the same command.
 3. The driver runs until the requested safe point. A step that is waiting on a tool keeps waiting until the tool finishes or the deadline passes.
-4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. The mailbox is untouched: messages keep arriving there exactly as before, and simply wait for the next consumer.
+4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. It also detaches from its queue, which leaves every unpulled message for whichever host resumes the agent.
 5. If the deadline passes first, the driver falls back to `Immediate`: it cancels running tool bodies through their child tokens, writes "not run" or "outcome unknown" results the same way crash repair would, and then quiesces. The result reports `DeadlineHit { forced: true }` so the operator knows the stop was not clean.
 
 ```rust
@@ -617,7 +618,7 @@ async fn settle_drain(cx: &mut AgentCtx, here: DrainPoint) -> Result<Option<Exit
     let Phase::Draining { at, deadline, .. } = &cx.phase else { return Ok(None) };
     if !(here.satisfies(*at) || Instant::now() >= *deadline) { return Ok(None); }
 
-    let snapshot = write_snapshot(cx, Completeness::Full).await?;  // every slot, inbox, seen set
+    let snapshot = write_snapshot(cx, Completeness::Full).await?;  // every slot and the inbox
     cx.log.append(Event::Quiesced {
         snapshot: snapshot.offset,
         at: here,
@@ -626,151 +627,151 @@ async fn settle_drain(cx: &mut AgentCtx, here: DrainPoint) -> Result<Option<Exit
     })?;
     cx.log.sync().await?;
     cx.log.release_lease().await?;
-    cx.mailbox.detach().await?;                   // messages keep landing; nobody consumes them
+    cx.queue.detach().await?;                     // unpulled messages stay for the next consumer
     cx.phase = Phase::Quiesced;
     cx.notify_drain_waiters(DrainResult::Quiesced { at: cx.log.offset() });
     Ok(Some(Exit::Quiesced))
 }
 ```
 
-A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, consumes the mailbox, and continues any suspended turn with no repair and no user message.
+A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, attaches to the queue, and continues any suspended turn with no repair and no user message.
 
-**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages that arrive meanwhile wait in its mailbox. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
+**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages sent meanwhile wait in its queue. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
 
-## Inbound messages
+## Message queue
 
-Every message to an agent, from a user, another agent, a scheduler or a webhook, arrives in an envelope:
+Every message for the model, from a user, another agent, a scheduler or a webhook, is published to the agent's queue, and the agent pulls it when it is ready. The queue is a service provided by a plugin, so its backend is the plugin's code: a broker shared by the whole cluster in production, an in-process channel in tests.
 
 ```rust
-pub struct Envelope {
-    pub agent: AgentId,
-    pub sender: SenderId,
-    pub sent_at: Timestamp,      // assigned once, by the sender or the cluster gateway
+pub trait MessageQueue: Plugin {
+    /// Become the only consumer of this agent's queue. Fails while another consumer holds it.
+    async fn attach(&self, agent: &AgentId) -> Result<QueueConsumer, QueueError>;
+}
+
+pub trait QueueConsumer: Send {
+    /// Up to `max` messages, oldest first; waits for at least one when `wait` is set.
+    async fn pull(&mut self, max: usize, wait: bool) -> Result<Vec<QueuedMessage>, QueueError>;
+    /// Remove messages from the queue. Unacknowledged messages are redelivered to the next consumer.
+    async fn ack(&mut self, upto: &QueueMsgId) -> Result<(), QueueError>;
+    /// Stop consuming. Anything not acknowledged stays in the queue.
+    async fn detach(self) -> Result<(), QueueError>;
+}
+
+pub struct QueuedMessage {
+    pub id: QueueMsgId,          // assigned by the queue, increasing within one agent's queue
     pub delivery: Delivery,      // NextTurn | NextStep
     pub body: MessageBody,
-    pub checksum: Digest,        // over a canonical encoding of all fields above
 }
 
-impl Envelope {
-    fn key(&self) -> (Timestamp, Digest) { (self.sent_at, self.checksum) }
-}
-```
-
-Two rules make deduplication work across hosts. The timestamp is assigned before the message is routed, never by the receiving host, so two copies of one message that reach different hosts are identical and have the same checksum. And the checksum covers the sender, the timestamp and the body, so two different messages with the same timestamp still sort deterministically and are not mistaken for each other. A sender that means to send the same text twice at the same instant must make the envelopes differ, for example with a sequence number in the body.
-
-Delivery has two halves, and only the second is part of the agent's state.
-
-1. **The mailbox** belongs to the host runtime, not to `AgentCtx`. Ingress appends every envelope to the agent's mailbox, syncs it, acknowledges the sender, and rings the agent's doorbell if it is running on this host. It does not check for duplicates or order, and it does not care whether the agent is running, quiesced, parked or already moved away.
-2. **The inbox** is in `AgentCtx`. It holds the messages the agent has taken in but not yet used, sorted and deduplicated, plus the checksums of messages it took in recently. It is written to the session log and to snapshots like the rest of the context.
-
-The mailbox is to the agent what a socket's receive buffer is to a process: bytes that have arrived but have not been read. Keeping it outside the context is what lets messages arrive while no context exists, and it does not weaken isolation, because each agent has its own mailbox and nothing but its single consumer reads it.
-
-```rust
-/// Host-side, durable, one per agent. Backend chosen in runtime config (local file, SQLite, a queue).
-pub trait Mailbox: Send + Sync {
-    /// Append and sync. Ingress acknowledges the sender only after this returns.
-    async fn append(&self, env: Envelope) -> Result<(), MailboxError>;
-    /// Read envelopes after `cursor`, oldest first. Only the attached consumer calls this.
-    async fn read(&self, cursor: Cursor, max: usize) -> Result<(Vec<Envelope>, Cursor), MailboxError>;
-    /// Drop everything up to `cursor`. Called only after the consumer has made those envelopes durable elsewhere.
-    async fn truncate(&self, upto: Cursor) -> Result<(), MailboxError>;
-}
-
-/// Exactly one consumer is attached to a mailbox at a time.
-pub enum Consumer {
-    Agent,                     // the agent's own task on this host
-    Forwarder { to: HostId },  // during a move: re-appends each envelope to the new host's mailbox
-}
-
-pub struct Inbox {
-    pending: BTreeMap<(Timestamp, Digest), Envelope>,  // taken in, not yet used by a turn or step
-    seen: SeenSet,                                     // checksums taken in during the last dedupe_horizon only
-    next_step: Vec<Input>,                             // claimed for the current turn's next step
-    newest: Timestamp,                                 // newest sent_at ever taken in
-}
-
-/// Run by the agent at every safe point, on a doorbell while idle or thawed, and on resume.
-async fn consume_mailbox(cx: &mut AgentCtx) -> Result<(), DriverError> {
-    let (batch, upto) = cx.mailbox.read(cx.mailbox_cursor, cx.config.inbox.batch).await?;
-    for env in batch {
-        match cx.inbox.offer(env, &cx.config.inbox) {
-            Offer::Accepted(env) => cx.log.append(Event::MessageReceived(env))?,
-            Offer::Duplicate => {}                                       // already taken in
-            Offer::Refused(env) => cx.log.append(Event::MessageRefused { checksum: env.checksum })?,
-        }
+/// Called by the driver when idle (wait) and at each step boundary (no wait).
+/// Never pulls while the agent is draining.
+async fn pull_messages(cx: &mut AgentCtx, mode: Pull) -> Result<(), DriverError> {
+    if cx.phase.is_draining() { return Ok(()); }
+    let batch = cx.queue.pull(cx.config.queue.batch, mode == Pull::Wait).await?;   // [config]
+    let Some(last) = batch.last().map(|m| m.id.clone()) else { return Ok(()) };
+    for msg in batch {
+        if msg.id <= cx.inbox.last_logged { continue; }          // redelivered after a crash: already logged
+        cx.log.append(Event::MessageReceived(msg.clone()))?;
+        cx.inbox.last_logged = msg.id.clone();
+        cx.inbox.push(msg);
     }
-    cx.log.sync().await?;              // the messages are durable in the agent's own log...
-    cx.mailbox.truncate(upto).await?;  // ...before they leave the mailbox
-    cx.mailbox_cursor = upto;
+    cx.log.sync().await?;            // in the agent's log...
+    cx.queue.ack(&last).await?;      // ...before it leaves the queue
     Ok(())
 }
-
-impl Inbox {
-    fn offer(&mut self, env: Envelope, cfg: &InboxConfig) -> Offer {
-        if self.seen.contains(&env.checksum) { return Offer::Duplicate; }
-        if env.sent_at < self.newest - cfg.dedupe_horizon {               // [config]
-            // Too old to prove it is not a duplicate whose record was pruned.
-            if cfg.late_policy == LatePolicy::Refuse { return Offer::Refused(env); } // [config]
-        }
-        self.seen.insert(env.checksum, env.sent_at);
-        self.newest = self.newest.max(env.sent_at);
-        self.pending.insert(env.key(), env.clone());
-        Offer::Accepted(env)
-    }
-
-    /// The driver takes the earliest pending message for a new turn.
-    fn take_next_turn(&mut self) -> Option<Input> { /* pop first NextTurn entry in key order */ }
-}
 ```
 
-A crash between `sync` and `truncate` leaves envelopes in the mailbox that are already in the log. They are read again on resume and dropped as duplicates, so the order of those two calls is what makes consumption safe without a transaction across the two stores.
+Three properties come from this ordering.
 
-Ordering is defined over what has not yet been used. Pending messages are always taken in `(timestamp, checksum)` order, so it does not matter which host received a message first or in what order forwarded batches arrive. Once a message has been taken into a turn, its place in the conversation is fixed and logged. A message that arrives after a later-stamped message was already used is still taken in, at the front of the pending set, and its log record is marked `late`. With the migration sequence below, this happens only to messages that reach the old host after the new host was released, which a short forwarding window keeps rare.
+1. **Nothing is lost.** A message leaves the queue only after it is durable in the agent's log. If the agent crashes in between, the queue redelivers it, and the agent recognizes it by its id because `last_logged` is rebuilt from the log.
+2. **Nothing arrives while quiesced.** A draining agent stops pulling, and a quiesced agent is detached. Messages wait in the queue in order, so the agent's own state never has to hold or sort messages it has not asked for.
+3. **One consumer at a time.** The queue plugin grants one consumer per agent queue, and the session store's epoch backs this up: a stale consumer cannot write `MessageReceived`, so it never acknowledges, and its messages go to the current owner.
 
-The seen set does not grow with the conversation. It only needs to remember a message for as long as another copy of that message could still be in flight, so it is pruned by timestamp to a window of `dedupe_horizon` behind the newest message taken in. Messages that are still pending need no entry of their own, since the pending map already catches their duplicates. Copies are in flight only during a sender's retries and while a forwarder is draining an old host's mailbox, so the horizon should cover the longest of those (the sender's retry limit, or the migration's `forward_grace`) and is minutes, not hours. At one message a second and a ten-minute horizon that is 600 entries of about 40 bytes, roughly 24 KB per agent. The set is part of every snapshot, so deduplication survives quiesce, crash and migration, and anything older than the horizon is handled by `late_policy`.
-
-If senders can attach a sequence number, a smaller structure is possible: per sender, the highest sequence number taken in plus any gaps below it. Its size depends on the number of senders rather than the message rate, but it requires every sender to number its messages, so it is an option for later rather than the default. Senders are expected to retry until acknowledged, and a host acknowledges only after the envelope is durable in a mailbox. Retries plus deduplication give each message exactly one admission.
+Duplicates sent by senders themselves, such as a client retrying a send, are the queue's concern. Most brokers can deduplicate on a sender-supplied message id within a window, and a queue plugin can expose that; the agent assumes that what it pulls is what was meant to be delivered.
 
 ## Migrating an agent between hosts
 
-Resizing a cluster moves agents by quiescing them on one host and resuming them on another. The orchestrator drives the sequence; the agent's own behavior is unchanged, and nothing the model sees records the move. The sequence below follows the eight steps in the requirements.
+Resizing a cluster moves agents by quiescing them on one host and resuming them on another. Because messages wait in the shared queue and the log is on a backend both hosts can reach, the move needs no step of its own.
 
-The mailbox makes migration a change of consumer. On A, the consumer of the agent's mailbox goes from the agent, to nobody, to a forwarder that re-appends each envelope to B's mailbox. On B, the agent attaches as the consumer of its own mailbox when it is thawed. Nothing in the delivery path is specific to migration.
-
-| Step | Host A | Host B | Session store |
-|---|---|---|---|
-| 1. Running on A | Messages land in A's mailbox; the agent consumes them | | Epoch `n`, owned by A |
-| 2. Quiesce requested | `Drain { at, deadline }`; the agent keeps consuming until it reaches the safe point | | |
-| 3. Quiescing and quiesced | Writes the complete snapshot and `Quiesced`, releases the lease, detaches; messages keep landing in A's mailbox | | Unowned; ends with `Quiesced` |
-| 4. Thawed on B | | `resume(id, StartMode::Thawed)`: opens the store, restores the snapshot, appends `Thawed`, attaches to B's mailbox; phase `Thawed` | Epoch `n+1`, owned by B |
-| 5. Messages arrive at both | Land in A's mailbox | Land in B's mailbox; the thawed agent consumes them (sorted, deduplicated) but runs no turn | |
-| 6. A's messages added to B | A forwarder attaches to A's mailbox and appends each envelope to B's mailbox, truncating only after B's append succeeds | Consumed like any other message; duplicates are dropped | |
-| 7. B restarts the agent | Forwarder keeps running | `Release`: phase becomes `Idle`; the suspended turn continues, then pending messages run in key order | |
-| 8. A torn down | Ingress stops acknowledging (senders retry against B); the forwarder empties the mailbox; the mailbox is deleted | | |
+1. Host A is running the agent and pulling from its queue.
+2. The orchestrator sends `Drain { at, deadline }` to the agent on A. It stops pulling and runs to the safe point.
+3. A writes the complete snapshot and `Quiesced`, releases the store lease, and detaches from the queue. Messages sent from now on wait in the queue.
+4. The orchestrator calls `resume` on host B. B opens the store (raising the epoch), rebuilds the context from the snapshot, attaches to the queue and runs. It continues any suspended turn, then pulls the messages that arrived during the move, in queue order.
+5. Host A can be torn down at any point after step 3.
 
 ```rust
-/// Orchestrator side. Each call is idempotent so the whole sequence can be retried.
+/// Orchestrator side. Each call is idempotent so the move can be retried.
 async fn migrate(id: AgentId, a: &HostClient, b: &HostClient, cfg: &MigrationConfig) -> Result<(), MigrateError> {
-    a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;          // steps 2-3
-    b.thaw(id).await?;                                                // step 4
-    cfg.directory.point(id, b.host()).await?;                         // step 5 begins as routes update
-    a.attach_forwarder(id, b.host()).await?;                          // step 6, runs until teardown
-    a.wait_mailbox_empty_once(id).await?;                             // everything A held at this point is on B
-    b.release(id).await?;                                             // step 7
-    a.teardown_after(cfg.forward_grace).await?;                       // step 8
+    a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;   // steps 2-3
+    b.resume(id).await?;                                       // step 4
     Ok(())
 }
 ```
 
-With a mailbox backend that both hosts can reach (a shared queue, for example), A and B append to the same mailbox, no forwarder is needed, and steps 5 and 6 collapse into one. The agent code is the same either way.
+If B fails during resume, the orchestrator resumes the agent on another host; the epoch rises again and nothing on B can write. If A never finished quiescing (it crashed), B's `resume` takes the slow path and repairs the log as after any crash.
 
-Three properties make the move transparent.
+## Creating an agent
 
-1. **Nothing is lost.** Every message is durable in a mailbox before it is acknowledged, and leaves a mailbox only after it is durable in the next place: the agent's log, or the next host's mailbox.
-2. **Nothing is admitted twice.** The seen set travels in the quiesce snapshot, so B recognizes messages A had already taken in, and any message delivered to both hosts or forwarded twice has one checksum.
-3. **Only one host writes.** Opening the store for B raises the epoch, and the store refuses any append that carries an older one. If A were still running because of a bug or a partition, its writes would fail rather than fork the log. The same fencing covers a failed move: if B dies while thawed, the orchestrator thaws the agent on another host, which raises the epoch again, and A's forwarder is pointed at the new host.
+Every agent's configuration is plugin-supplied, which raises the question of where the first configuration comes from. The answer is one runtime-level plugin, the **provisioner**, named in the process's startup file together with the runners the process offers. That file is the only configuration that is not produced by a plugin.
 
-Waiting for A's mailbox to empty once before releasing B means everything that arrived during the quiesce window is sorted before B runs anything. Messages that reach A after that are still delivered, as late arrivals, until A is torn down.
+```toml
+# runtime.toml: read once at process start
+[runners]
+enable = ["builtin.*", "wasm", "process.python", "mcp"]
+
+[provisioner]
+runner = "process.python"
+code.package = { name = "acme-provisioner", version = "1.0.4", digest = "sha256:51ab..." }
+grants = { hosts = ["tenants.internal"], secrets = ["secret://platform/tenant-db"] }
+```
+
+```rust
+/// The one plugin loaded per process instead of per agent. It runs in its own
+/// small context with its own grants and never sees any agent's state.
+pub trait Provisioner: Plugin {
+    /// Produce everything needed to build a new agent.
+    async fn provision(&self, req: CreateRequest) -> Result<AgentSpec, ProvisionError>;
+    /// Where an existing agent's log lives, so any host can resume it.
+    async fn locate(&self, id: &AgentId) -> Result<StoreLocator, ProvisionError>;
+}
+
+pub struct CreateRequest {
+    pub tenant: TenantId,
+    pub template: String,          // e.g. "support", "coder"
+    pub params: toml::Table,       // caller-supplied values the template may use
+}
+
+pub struct AgentSpec {
+    pub id: AgentId,
+    pub config: AgentConfig,                     // every plugin: runner, code, grants
+    pub locator: StoreLocator,                   // where the log will live
+    pub initial_state: Vec<(PluginId, StateBlob)>,
+    pub initial_events: Vec<Event>,              // e.g. seed instructions or a first message
+}
+
+pub async fn create(rt: &Runtime, req: CreateRequest) -> Result<AgentHandle, CreateError> {
+    let spec = rt.provisioner.provision(req).await?;
+    let store = rt.open_store(&spec.locator, LeaseMode::CreateExclusive).await?;  // fails if it exists
+
+    // Same build path as resume: load every plugin through its runner.
+    let mut cx = AgentCtx::build(rt, &spec.config, store).await?;
+    cx.log.write_header(&spec.config)?;
+    for (pid, blob) in spec.initial_state {
+        cx.state.insert(&pid, cx.plugins[&pid].decode_state(blob)?);
+    }
+    for event in spec.initial_events { cx.log.append(event)?; }
+    write_snapshot(&mut cx, Completeness::Full).await?;
+    cx.log.sync().await?;
+
+    cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&cx.id).await?;
+    cx.phase = Phase::Idle;
+    Ok(rt.spawn_agent(cx))
+}
+```
+
+The provisioner is consulted once per agent. After `create`, the agent's configuration lives in its own log header, and every later start, on any host, rebuilds the context from that header without calling `provision` again; only `locate` is used, to find the log. A configuration change after creation is a `Reconfigure` command, which the provisioner can issue like any other caller, and which is logged so that a resume replays it.
+
+Because the provisioner is a plugin like any other, it can be as simple or as elaborate as a deployment needs: `builtin.provisioner.templates` whose code is a directory of TOML templates with tenant variables filled in, or a `process.python` application that reads tenant settings from a database. A provisioner that is unavailable stops new agents from being created and agents from being located, but it does not affect agents that are already running.
 
 ## Isolation in a multi-tenant process
 
@@ -790,7 +791,7 @@ Isolation has four layers, from the language up to the operating system.
 
 ## Worked example
 
-Two agents in the same process, owned by different tenants and configured differently. Each is one TOML document; the runtime records it in the agent's log header at creation.
+Two agents in the same process, owned by different tenants and configured differently. Each is one TOML document, as a provisioner might return it; the runtime records it in the agent's log header at creation.
 
 ```toml
 # Agent A: a coding agent with only built-in plugins.
@@ -813,6 +814,12 @@ grants = { secrets = ["secret://acme/model-key"], hosts = ["api.example.com"] }
 id = "store"
 runner = "builtin.store.jsonl"
 code.inline = { snapshot_every_steps = 20 }
+
+[[plugin]]
+id = "queue"
+runner = "builtin.queue.nats"
+code.inline = { url = "nats://queue.acme.internal:4222", stream = "agents" }
+grants = { hosts = ["queue.acme.internal"] }
 
 [[plugin]]
 id = "compaction"
@@ -865,9 +872,11 @@ code.inline = { command = ["globex-crm-mcp"], tools = ["lookup_customer", "open_
 [resume]
 after_crash = "wait"
 
-[inbox]
-dedupe_horizon = "10m"
-late_policy = "refuse"
+[[plugin]]
+id = "queue"
+runner = "builtin.queue.nats"
+code.inline = { url = "nats://queue.globex.internal:4222", stream = "agents" }
+grants = { hosts = ["queue.globex.internal"] }
 ```
 
 What the loop does with B's Python plugin:
@@ -883,17 +892,18 @@ What the loop does with B's Python plugin:
 Decided after review of the first draft:
 
 1. **Behavior after a crash is configuration.** `resume.after_crash` is a required per-agent field, `wait` or `continue { max }`, with no implicit default.
-2. **Crash resume replays the log; quiesce resume does not.** Periodic snapshots are optional and off by default, since a slower resume after a crash is acceptable. The quiesce snapshot is complete, so a quiesced agent is rebuilt from it plus the messages that arrived while it was quiesced.
+2. **Crash resume replays the log; quiesce resume does not.** Periodic snapshots are optional and off by default, since a slower resume after a crash is acceptable. The quiesce snapshot is complete, so a quiesced agent is rebuilt from it alone; messages sent meanwhile are still in the queue.
 3. **One hook definition for every non-Rust runner.** The hooks are defined once as WIT, and the JSON-RPC schema for `process` runners and the Rust bindings are generated from it.
 4. **`process` plugins run one process per agent.**
 5. **A drain does not deny pending approvals.** A parked agent stays parked through a quiesce or a move, and the request is still waiting when it resumes.
 6. **Storage backends are configurable** through the `SessionStore` plugin, per agent.
+7. **Inbound messages wait in a shared queue, provided by a plugin.** An agent pulls only when it can use a message, so nothing arrives while it is quiesced, and moving it between hosts is a quiesce and a resume.
+8. **New agents come from a provisioner plugin** named in the process's startup file. After creation, an agent is rebuilt from its own log.
 
 Still open:
 
-1. **Late arrivals.** The default for `late_policy` (refuse or admit). Refusing is safer against duplicates; admitting is safer against loss when a host was partitioned for longer than the horizon. The horizon itself should follow from the retry and forwarding limits rather than be tuned separately.
-2. **Where timestamps come from.** Sender clocks are simplest, but skew between senders changes the order in which their messages are taken. A cluster gateway that stamps every message gives one clock, at the cost of a component every message must pass through.
-3. **Telling the model about late messages.** A late message is logged with a `late` flag. Whether the request builder should show that to the model, for example as "this message was sent before your last reply", is a prompt-design question.
+1. **Message order across senders.** The queue delivers in the order it received messages. If ordering by when a message was sent matters more than when it arrived, the queue plugin would need to reorder, which most brokers do not do.
+2. **Provisioner availability.** Resuming an agent needs `locate`. A deterministic locator (the log's location derived from the agent id) removes that dependency; a directory lookup is more flexible but makes the provisioner part of every resume.
 
 ## What this borrows
 
@@ -908,5 +918,5 @@ Still open:
 | Sequential preparation of tool calls, parallel execution, typed stop outcomes | Grok Build |
 | Hard caps on steps and forced continuations | Grok Build (forced continuations), opencode (steps) |
 | Session actor that owns its state and takes commands over a channel | Grok Build |
-| Runner and code split, immutable plugin instances, state slots, drain, park and thaw phases | New in this proposal |
-| Sender-stamped envelopes sorted and deduplicated by `(timestamp, checksum)`, a per-host mailbox outside the context with one consumer at a time, epoch fencing for moves between hosts | New in this proposal |
+| Runner and code split, immutable plugin instances, state slots, drain and park phases | New in this proposal |
+| Pull-based message queue plugin, epoch fencing for moves between hosts, provisioner plugin for initial configuration | New in this proposal |
