@@ -169,7 +169,7 @@ pub trait Runner: Send + Sync + 'static {
     /// Version of the state-slot format this runner writes. Bumped on incompatible change.
     fn state_version(&self) -> u32;
 
-    /// Validate and load `code` for one agent. Misconfiguration fails here, at creation
+    /// Validate and load `code` for one agent. Misconfiguration fails here, at creation,
     /// thaw or recovery, never later in the loop.
     async fn load(&self, code: &Code, grants: &PluginGrants, env: &LoadEnv)
         -> Result<LoadedPlugin, LoadError>;
