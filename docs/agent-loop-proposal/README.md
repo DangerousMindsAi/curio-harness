@@ -30,17 +30,17 @@ This builds on the [architecture survey](../harness-survey/README.md), the [agen
 
 ## Summary
 
-The process hosts a `Runtime` that holds only shared, immutable machinery: a registry of runners, storage backends, a scheduler and the provisioner plugin. Each agent is one async task that exclusively owns an `AgentCtx`, and every piece of per-agent state lives in that struct. Nothing per-agent is reachable through a global, a static, or a task-local.
+The process hosts a `Runtime` that holds only shared, immutable machinery: a registry of runners, a scheduler, and two runtime-level plugins, the log store and the provisioner. Each agent is one async task that exclusively owns an `AgentCtx`, and every piece of per-agent state lives in that struct. Nothing per-agent is reachable through a global, a static, or a task-local.
 
-Every behavior is a plugin, including the loop driver, the model provider, the session store and each tool. A plugin is a pair: a **runner**, which is Rust code compiled into the host and implementing the `Runner` trait, and **code**, which is whatever the runner interprets. For a built-in runner the code is a block of configuration; for a WASM or Python runner it is a whole program. Runners are shared by every agent in the process and hold no agent state. Loading code through a runner produces a plugin instance that is immutable after load; its mutable state lives in a typed slot in the agent's context. This split is what makes checkpointing uniform and isolation checkable: the harness can serialize every slot without trusting each plugin to remember to, and a plugin has nowhere else to keep state.
+Every behavior is a plugin, including the loop driver, the model provider, the message queue and each tool. A plugin is a pair: a **runner**, which is Rust code compiled into the host and implementing the `Runner` trait, and **code**, which is whatever the runner interprets. For a built-in runner the code is a block of configuration; for a WASM or Python runner it is a whole program. Runners are shared by every agent in the process and hold no agent state. Loading code through a runner produces a plugin instance that is immutable after load; its mutable state lives in a typed slot in the agent's context. This split is what makes checkpointing uniform and isolation checkable: the harness can serialize every slot without trusting each plugin to remember to, and a plugin has nowhere else to keep state.
 
-The default driver is a small loop in the style of DeepSeek Harness. Each turn is a series of steps; each step is one model request (with retries) plus the tools that request asks for. Plugins intercept it at a short list of typed hooks. Every input the model sees is first appended to the agent's session log, and each request is rebuilt from that log, so the log is enough to resume.
+The default driver is a small loop in the style of DeepSeek Harness. Each turn is a series of steps; each step is one model request (with retries) plus the tools that request asks for. Plugins intercept it at a short list of typed hooks. Every input the model sees is first appended to the agent's session log, and the conversation each request is built from is a projection of that log, so the log is enough to recover after a crash.
 
-Checkpointing is event-sourced. The log is forced to disk before every model request and before every tool body, and a snapshot of plugin state slots is written at step boundaries. Resume rebuilds the context from the recorded configuration, restores the last snapshot, replays the events after it, and patches any loose ends the same way DeepSeek does.
+Crash recovery is event-sourced. The log is forced to durable storage before every model request and before every tool body. After a crash, the context is rebuilt from the configuration recorded in the log, the events are replayed, and loose ends are patched the same way DeepSeek does.
 
-Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), writes a complete snapshot and a `Quiesced` marker, and releases the session. A quiesced agent resumes exactly where it stopped, from the snapshot alone, with no replay, no repair and no user message needed. None of the three surveyed harnesses can do this.
+Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), and serializes the whole context into an `AgentImage`. Thawing that image, on the same host or another, gives back the agent exactly where it stopped, with no log replay, no repair and no user message needed. None of the three surveyed harnesses can do this.
 
-Inbound messages wait in a shared message queue, which is itself a plugin. An agent pulls from its queue only when it is ready to use a message, so a quiesced agent simply stops pulling and anything sent meanwhile stays in the queue. That makes moving an agent between hosts, when a cluster is resized, a quiesce on the old host followed by a resume on the new one. A fencing epoch on the session store guarantees that only one host can write to the agent at a time.
+Inbound messages wait in a shared message queue, which is itself a plugin. An agent pulls from its queue only when it is ready to use a message, so a quiesced agent simply stops pulling and anything sent meanwhile stays in the queue. That makes moving an agent between hosts, when a cluster is resized, three steps: quiesce on the old host, transfer the image (outside the harness), and thaw on the new host. A fencing epoch on the log guarantees that only one host can append to it at a time.
 
 A new agent's context comes from a provisioner plugin. The provisioner is the one plugin configured outside any agent, in the process's own startup file; given a request to create an agent, it returns the agent's configuration and initial state. From then on the agent is rebuilt from its own log and never asks the provisioner again.
 
@@ -50,28 +50,30 @@ A new agent's context comes from a provisioner plugin. The provisioner is the on
 |---|---|
 | Everything is a plugin | The driver, model, store, tools and all policy are plugins behind service kinds and hooks ([Runners and code](#runners-and-code), [Hooks](#hooks)). Swapping the driver swaps the loop. |
 | Written in Rust | Runner and plugin interfaces are Rust traits; the agent is a single-owner task, so the context needs no locks ([The agent context](#the-agent-context)). |
-| Checkpoint and resume | Write-ahead save points, snapshots of state slots at step boundaries, and a resume procedure that replays and repairs ([Checkpoint and resume](#checkpoint-and-resume)). Graceful quiesce is covered in its own section. |
+| Checkpoint and resume | A serializable context that quiesce turns into an image and thaw restores; write-ahead save points and log replay for crashes ([Checkpoint and resume](#checkpoint-and-resume), [Quiesce](#quiesce-and-graceful-shutdown)). |
 | Many agents per process, configured independently, strictly isolated, all state in a context variable | One `AgentCtx` per agent holding all mutable state; immutable plugin instances; per-agent capability grants and quotas; isolation level chosen per runner kind ([Isolation](#isolation-in-a-multi-tenant-process)). |
 | Plugins are a runner plus code | `Runner::load(code) -> Plugin` with code being configuration, a WASM component, or an external program ([Runners and code](#runners-and-code)). |
-| Move agents between hosts transparently when resizing a cluster | Messages wait in a shared queue plugin; quiesce on the old host, resume on the new one ([Message queue](#message-queue), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
+| Move agents between hosts transparently when resizing a cluster | Messages wait in a shared queue plugin; quiesce produces an image on the old host and thaw restores it on the new one ([Message queue](#message-queue), [Migrating an agent between hosts](#migrating-an-agent-between-hosts)). |
 | Initial configuration is also a plugin | A provisioner plugin, named in the process's startup file, produces each new agent's configuration and initial state ([Creating an agent](#creating-an-agent)). |
 
 ## Vocabulary
 
-- **Runtime**: the per-process host. Holds the runner registry, storage backends, the scheduler and the provisioner. Shared by all agents, never mutated by them.
+- **Runtime**: the per-process host. Holds the runner registry, the scheduler, the log store and the provisioner. Shared by all agents, never mutated by them.
 - **Agent**: one configured conversation partner with its own session log. Owned by exactly one task.
 - **AgentCtx**: the struct that holds all of one agent's mutable state. The "context variable" from the requirements.
 - **Runner**: a Rust type implementing `Runner`, registered once per process under a kind name such as `builtin.compaction` or `wasm`.
 - **Code**: what a runner loads for one plugin: an inline config table, a file, or a versioned package, always pinned by digest.
 - **Plugin instance**: what `Runner::load` returns for one agent. Immutable after load.
 - **State slot**: the mutable, serializable state of one plugin instance, stored in `AgentCtx`.
-- **Service**: a capability with exactly one provider per agent (`Driver`, `Model`, `SessionStore`, `MessageQueue`, `Approval`) or many (`Tool(name)`).
+- **Service**: a capability with exactly one provider per agent (`Driver`, `Model`, `MessageQueue`, `Approval`) or many (`Tool(name)`).
 - **Hook**: a typed interception point the driver or tool pipeline dispatches to every subscribed plugin, in order.
 - **Turn / step / attempt**: as in DeepSeek. A turn answers one input; a step is one model request plus its tools; an attempt is one try at the request.
 - **Safe point**: a moment where the agent's state is consistent and can be snapshotted or quiesced: before a step starts, or after a turn ends.
 - **Message queue**: the service an agent's inbound messages wait in until the agent pulls them. Provided by a plugin, so the backend (a shared broker, a database table, an in-process channel for tests) is configuration.
-- **Provisioner**: the plugin that produces a new agent's configuration and initial state. The only plugin that is configured per process instead of per agent.
-- **Epoch**: a counter on the agent's session store that increases each time a host takes ownership. Writes carrying an older epoch are refused.
+- **Log store**: where session logs are kept. Part of the hosting infrastructure: a runtime-level plugin configured once per process, the same for every tenant, and not necessarily local.
+- **Provisioner**: the plugin that produces a new agent's configuration and initial state. Like the log store, configured per process instead of per agent.
+- **Agent image**: the serialized `AgentCtx` of a quiesced agent. Quiesce produces it and thaw consumes it; how it travels between hosts is outside the harness.
+- **Epoch**: a counter on an agent's log that increases each time a host takes ownership. Appends carrying an older epoch are refused.
 
 ## Process layout
 
@@ -79,9 +81,9 @@ A new agent's context comes from a provisioner plugin. The provisioner is the on
 process
 └── Runtime (shared, immutable after start)
     ├── RunnerRegistry: kind -> Arc<dyn Runner>
-    ├── StoreBackends:  where session logs live (files, SQLite, object store)
+    ├── LogStore:       runtime-level plugin; where every agent's session log lives (any backend)
     ├── Scheduler:      per-tenant quotas, admission, fair sharing of model/tool slots
-    ├── Provisioner:    the one runtime-level plugin; creates agent configs, locates agent logs
+    ├── Provisioner:    runtime-level plugin; creates new agents' configs and initial state
     └── agents: AgentId -> AgentHandle      (a channel sender, no state)
 
 agent task (one per live agent, owns everything below)
@@ -89,7 +91,8 @@ agent task (one per live agent, owns everything below)
     ├── config          pinned in the log at creation
     ├── plugins         immutable instances, in hook order, plus a service index
     ├── state           one slot per plugin
-    ├── log             append-only session log (via the SessionStore plugin)
+    ├── log             append-only session log (via the LogStore plugin)
+    ├── history         the conversation the next request is built from; a projection of the log
     ├── inbox           messages pulled from the queue and not yet used; next_turn / next_step
     ├── queue           this agent's consumer on its message queue (via the MessageQueue plugin)
     ├── phase           Idle | Running | Draining | Parked | Quiesced | Closed
@@ -123,7 +126,8 @@ pub struct AgentCtx {
     config: Arc<AgentConfig>,        // as recorded in the log; changes only via Reconfigure
     plugins: PluginTable,            // Box<dyn Plugin> in hook order + service index
     state: StateSlots,               // PluginId -> Box<dyn PluginState>
-    log: SessionLog,                 // append, sync, read; backed by the SessionStore service
+    log: SessionLog,                 // append and sync; backed by the runtime's LogStore
+    history: History,                // model-visible conversation; changes only through log.append
     inbox: Inbox,                    // pulled, logged and acknowledged, not yet used by a turn or step
     queue: QueueConsumer,            // exclusive consumer of this agent's queue
     phase: Phase,
@@ -139,11 +143,11 @@ pub enum Phase {
     Running { turn: TurnId },
     Draining { at: DrainPoint, deadline: Instant, waiters: Vec<oneshot::Sender<DrainResult>> },
     Parked { waiting_on: RequestId },  // e.g. a human approval; may be evicted from memory
-    Quiesced,                          // snapshot written, lease released, queue detached; task has exited
+    Quiesced,                          // image produced, lease released, queue detached; task has exited
     Closed,
 }
 
-/// Mutable state of one plugin. Serialized into snapshots; restored on resume.
+/// Mutable state of one plugin. Serialized into images and snapshots; restored on thaw or recovery.
 pub trait PluginState: Send + erased_serde::Serialize + Any {}
 ```
 
@@ -151,7 +155,7 @@ Three properties follow from this layout.
 
 1. **The context is a parameter, never ambient.** Every hook receives a borrow of the context (or a narrower view of it), so a plugin that tries to reach another agent's state has nothing to name. A `tokio::task_local!` would look tidier, but it silently disappears in tasks spawned for tool bodies and makes cross-agent leaks a runtime question instead of a compile-time one.
 2. **One owner, no locks.** The agent task holds `&mut AgentCtx` for its whole life. Concurrency inside an agent (parallel tool bodies) gets a read-only `ToolCx` built from the context, and any change those bodies want to make comes back as data in their results.
-3. **The context is reconstructible.** `config` and the plugin table are rebuilt from the log header; `state`, `inbox` and `counters` are rebuilt from the last snapshot plus the events after it. Nothing else needs saving.
+3. **The context is serializable.** Everything in it is either data (`config`, `state`, `inbox`, `history`, `counters`) or rebuilt from that data on load (the plugin table, grants, quota and the queue consumer). Serializing it is how an agent is quiesced and moved; it can also be rebuilt from the log alone, which is how it recovers from a crash.
 
 ## Runners and code
 
@@ -166,7 +170,7 @@ pub trait Runner: Send + Sync + 'static {
     fn state_version(&self) -> u32;
 
     /// Validate and load `code` for one agent. Misconfiguration fails here, at creation
-    /// or resume, never later in the loop.
+    /// thaw or recovery, never later in the loop.
     async fn load(&self, code: &Code, grants: &PluginGrants, env: &LoadEnv)
         -> Result<LoadedPlugin, LoadError>;
 
@@ -226,8 +230,10 @@ pub trait Tool: Plugin {
     async fn call(&self, cx: ToolCx, args: Value) -> ToolResult;
 }
 
-pub trait SessionStore: Plugin {
-    async fn open(&self, id: &SessionId, lease: LeaseMode) -> Result<StoreHandle, StoreError>;
+/// Runtime-level: one instance per process, configured in the startup file.
+pub trait LogStore: Plugin {
+    /// Open an agent's log for appending. Raises the log's epoch; appends from older epochs fail.
+    async fn open(&self, id: &AgentId, mode: OpenMode) -> Result<SessionLog, StoreError>;
 }
 
 pub trait MessageQueue: Plugin {
@@ -236,7 +242,7 @@ pub trait MessageQueue: Plugin {
 }
 ```
 
-The `Provisioner` trait is described in [Creating an agent](#creating-an-agent).
+The `Provisioner` trait is described in [Creating an agent](#creating-an-agent). `LogStore` and `Provisioner` are the two runtime-level services: their plugins are named in the process's startup file instead of in an agent's config, because they are part of the hosting infrastructure and are needed before any agent exists.
 
 ### Runner kinds
 
@@ -269,7 +275,7 @@ Listeners run in ascending `Subscription::order`, with ties broken by their posi
 
 | Hook | Dispatched | Payload a listener may change | Typical plugins |
 |---|---|---|---|
-| `agent_loaded` | After create or resume, before any work | May enqueue context into `next_step` | Instructions loader, session-start hooks |
+| `agent_loaded` | After create, thaw or recovery, before any work | May enqueue context into `next_step` | Instructions loader, session-start hooks |
 | `pre_step` | At the start of each step, after claiming `next_step` input | Add context messages, compact history, `Reject` (turn ends blocked) | Compaction, time context, skills, plan mode, goal driver |
 | `request` | Before each attempt | Model route, effort, max tokens, tool choice | Model selection, cost router |
 | `request_error` | After a failed attempt | Set `decision = Retry` only after proving progress (for example, compaction changed the history) | Retry with backoff, overflow compaction, image offload |
@@ -279,13 +285,13 @@ Listeners run in ascending `Subscription::order`, with ties broken by their posi
 | `tool_post` | Per result, sequentially in model order | Rewrite the result, attach context for the next step, mark the turn concluded | Spill, repeat reminders |
 | `turn_stopping` | When nothing is owed and `next_step` is empty | Enqueue into `next_step` to force another step | Stop hooks, todo gate, goal verification |
 | `turn_ended` | After the turn's end record is written | Enqueue into `next_turn` | Goal round driver, notifications |
-| `snapshot` | At a snapshot safe point | Contribute opaque state (only plugins whose state is not in a slot, such as `process` plugins) | Python and WASM runners |
-| `replay` | For each event after the snapshot during resume | Rebuild derived state in the slot; no side effects allowed | Retry counters, repeat counters |
+| `snapshot` | When an image or a periodic snapshot is taken | Contribute opaque state (only plugins whose state is not in a slot, such as `process` plugins) | Python and WASM runners |
+| `replay` | For each event replayed during crash recovery | Rebuild derived state in the slot; no side effects allowed | Retry counters, repeat counters |
 | `drain_requested` | When a drain is requested | Stop admitting background work; report what must finish | Background jobs, subagents, schedulers |
 
 Two rules hold for every hook:
 
-1. **Model-visible implies logged.** A hook that changes what the model will see does so by appending an event through `HookCx::append`. The request builder reads only the log, so a hook cannot inject anything that a resumed agent would not also see.
+1. **Model-visible implies logged.** A hook that changes what the model will see does so by appending an event through `HookCx::append`. The request builder reads only `history`, which changes only when an event is appended, so a hook cannot inject anything that a recovered agent would not also see.
 2. **Hooks that run concurrently get no mutable state.** `tool_execute` is the only hook that can run in parallel with itself, so it receives `&ToolCx`, not `&mut HookCx`. Anything it learns returns inside the `ToolResult` and is folded into state by `tool_post`, which runs in model order.
 
 ## The loop
@@ -329,7 +335,7 @@ async fn run_turn(cx: &mut AgentCtx, input: Input) -> Result<TurnEnd, DriverErro
     let mut forced = 0;
 
     let end = loop {
-        // Safe point: between steps. A snapshot may be taken; a drain may stop here.
+        // Safe point: between steps. A periodic snapshot may be taken; a drain may stop here.
         maybe_snapshot(cx, SafePoint::StepBoundary).await?;
         cx.apply_pending_commands()?;
         if cx.drain_point_reached(DrainPoint::Step) {
@@ -384,7 +390,7 @@ async fn run_step(cx: &mut AgentCtx, step: StepInput) -> Result<StepOutcome, Dri
         let mut route = cx.config.driver.default_route.clone();       // [config]
         dispatch(cx, Hook::Request(&mut route)).await?;               // [hook] request
 
-        let request = build_request(&cx.log, &route, &cx.plugins.tool_specs());  // from the log only
+        let request = build_request(&cx.history, &route, &cx.plugins.tool_specs());  // log projection only
         cx.log.sync().await?;                    // save point: before the model request
 
         let _slot = cx.quota.acquire_model_slot().await?;             // tenant fairness
@@ -475,91 +481,116 @@ A turn ends when the model answers without tool calls, a tool concludes the turn
 
 ## Checkpoint and resume
 
-### What is saved
+An agent is restored in one of two ways, depending on whether it stopped cleanly.
 
-The session log is the source of truth. It holds three kinds of record:
+| | Quiesce, then thaw | Crash, then recover |
+|---|---|---|
+| What it starts from | The `AgentImage` produced by the drain | The session log |
+| Reads the log? | No; it only appends to it | Yes; replays it |
+| Repair needed? | No | Yes: dangling tool calls, open step and turn |
+| Cost | Deserialize one image | Replay the log (a little slower, which is acceptable) |
+
+### The agent image
+
+```rust
+/// A quiesced agent: the whole AgentCtx as data. Produced by settle_drain;
+/// moving it between hosts is outside the harness.
+#[derive(Serialize, Deserialize)]
+pub struct AgentImage {
+    pub id: AgentId,
+    pub tenant: TenantId,
+    pub config: AgentConfig,                       // every plugin: runner kind, code digest, grants
+    pub slots: Vec<(PluginId, u32, StateBlob)>,    // every slot, with its runner's state_version
+    pub history: History,                          // what the next model request is built from
+    pub inbox: Inbox,                              // pulled and logged, not yet used
+    pub counters: Counters,
+    pub suspended_turn: Option<TurnId>,            // set when drained at a step boundary
+    pub log_position: LogPosition,                 // offset and epoch the image is consistent with
+}
+```
+
+Plugins with state outside a slot, such as a Python application in its own process, contribute a blob through the `snapshot` hook, and it goes into `slots` like any other. The image does not contain the plugin instances, grants, quota handle or queue consumer: those are rebuilt on thaw from `config` by the same path that creates an agent.
+
+### The session log
+
+The log is the durable record used for crash recovery and for audit. It lives in the runtime's `LogStore`, which is hosting infrastructure: configured once per process, the same for every tenant, and not necessarily on the local machine. Any host can therefore open any agent's log by its id. It holds:
 
 1. **A header** written once at creation from the provisioner's output: agent id, tenant, the full `AgentConfig` with every runner kind, code digest and grant, and each runner's `state_version`.
-2. **Events**: messages pulled from the queue (with their queue ids), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations.
-3. **Snapshots**: at a safe point, one record holding state slots (serialized with each runner's format and version), the inbox, the counters, and the log offset it covers.
+2. **Events**: messages pulled from the queue (with their queue ids and send times), turn and step boundaries, admitted context, assistant replies, tool calls, starts and results, failed attempts, reconfigurations, and `Quiesced` and `Thawed` markers.
+3. **Periodic snapshots**, optional and off by default (`[config] snapshot.every_steps`), which only shorten crash recovery. Plugins whose state can be derived from events mark their slot `derived` and rebuild it in `replay`.
 
-There are two kinds of snapshot, because crash recovery and quiesce have different needs.
-
-- **Periodic snapshots** are optional and off by default (`[config] snapshot.every_steps`). Crash recovery replays the log from the start, or from the last periodic snapshot if there is one, and a little extra time on resume after a crash is acceptable. Plugins whose state can be derived from events (retry counters, repeat counters) mark their slot `derived` and rebuild it in `replay`, so a periodic snapshot may leave those slots out.
-- **The quiesce snapshot** is complete. It holds every slot, derived ones included, plus the full inbox, so resuming from it needs no replay at all. Messages sent while the agent was quiesced are still in the queue and are pulled normally once it runs again. Plugins with opaque state, such as a Python application, contribute a blob through the `snapshot` hook in both kinds.
-
-### When it is forced to disk
+### When it is forced to durable storage
 
 | Save point | Why |
 |---|---|
 | Before each model request | The request can be rebuilt exactly; a crash during streaming loses only the partial reply |
-| Before each tool body (`ToolStarted`) | Resume can tell "might have run" from "never ran" ([crash recovery note 2](../crash-recovery/README.md#notes-for-curio-harness)) |
+| Before each tool body (`ToolStarted`) | Recovery can tell "might have run" from "never ran" ([crash recovery note 2](../crash-recovery/README.md#notes-for-curio-harness)) |
 | End of each turn | A finished turn is never lost |
 | After pulling messages, before acknowledging them to the queue | A message leaves the queue only once it is in the agent's log |
-| At quiesce | The agent can be resumed from the snapshot with no replay or repair |
+| At quiesce, before the image is handed over | The log and the image agree on `log_position` |
 
-Between save points the `SessionStore` plugin may batch writes. Periodic snapshots are an optimization for crash-resume time and never needed for correctness: resume from the header and the full event stream gives the same context. The quiesce snapshot is the exception, since a quiesced agent is rebuilt from it directly.
+Between save points the log store plugin may batch writes.
 
-Storage is configurable per agent: the `SessionStore` is a plugin, so the backend (local JSONL files, SQLite, an object store) is chosen in the agent's config. Moving an agent between hosts needs the new host to reach the same log, which means either a shared backend or a store plugin that ships the log with the quiesce snapshot. The provisioner's `locate` tells a host where an agent's log is ([Creating an agent](#creating-an-agent)).
-
-### Resume
+### Thaw
 
 ```rust
-/// Take ownership of an existing agent on this host and start it. Used after a
-/// crash, after a quiesce on this host, and as the second half of a move.
-pub async fn resume(rt: &Runtime, id: AgentId)
-    -> Result<AgentHandle, ResumeError>
-{
-    // 1. Exclusive ownership. Opening bumps the store's epoch; every later write
-    //    carries it, and the store refuses writes from any older epoch.
-    let locator = rt.provisioner.locate(&id).await?;                 // where the log lives
-    let store = rt.open_store(&locator, LeaseMode::Exclusive).await?;
-    let header = store.read_header().await?;
+/// Restore a quiesced agent from its image, on this host or any other.
+pub async fn thaw(rt: &Runtime, image: AgentImage) -> Result<AgentHandle, ThawError> {
+    // 1. Take ownership of the log. Raises the epoch, so a stale host can no longer append.
+    //    Refuses if the log has moved past the image: the image is out of date.
+    let log = rt.log_store.open(&image.id, OpenMode::ContinueFrom(image.log_position)).await?;
 
-    // 2. Rebuild plugins from the recorded config. A missing runner kind or a
+    // 2. Rebuild plugins from the config in the image. A missing runner kind or a
     //    digest mismatch fails loud; nothing silently falls back.
-    let mut cx = AgentCtx::build(rt, &header.config, store).await?;
+    let mut cx = AgentCtx::build(rt, &image.config, log).await?;
 
-    match cx.log.tail_marker().await? {
-        // Fast path: the log ends with a quiesce marker and a complete snapshot.
-        Some(Marker::Quiesced { snapshot, suspended_turn }) => {
-            restore_slots(rt, &mut cx, &header, &snapshot, Completeness::Full)?;
-            cx.inbox = snapshot.inbox;               // pulled but not yet used
-            cx.counters = snapshot.counters;
-            cx.log.append(Event::Resumed { host: rt.host_id(), epoch: cx.log.epoch() })?;
-            if let Some(turn) = suspended_turn { cx.inbox.resume_turn(turn); }
-        }
-
-        // Slow path: no quiesce marker, so the process stopped without draining.
-        _ => {
-            let snap = cx.log.latest_snapshot().await?;          // periodic, if any
-            if let Some(snap) = &snap {
-                restore_slots(rt, &mut cx, &header, snap, Completeness::Partial)?;
-                cx.inbox = snap.inbox.clone();
-                cx.counters = snap.counters.clone();
-            }
-            // Replay events after the snapshot (or from the start). Hooks see
-            // Replay and must not cause side effects.
-            for event in cx.log.events_after(snap.map(|s| s.offset)).await? {
-                cx.fold(&event);                                 // inbox, counters, phase
-                dispatch(&mut cx, Hook::Replay(&event)).await?;  // [hook] replay
-            }
-            if let Tail::Crashed { dangling, .. } = classify_tail(&cx.log) {
-                repair_crash(&mut cx, dangling)?;
-                if header.config.resume.after_crash.should_continue(&cx.counters) { // [config]
-                    cx.inbox.push_next_turn(Input::system(RESTARTED_NOTICE), &mut cx.log)?;
-                }
-            }
-        }
+    // 3. Restore every slot, migrating any whose runner version moved.
+    for (pid, version, blob) in image.slots {
+        cx.state.insert(&pid, restore_slot(rt, &cx, &pid, version, blob)?);
     }
+    cx.history = image.history;
+    cx.inbox = image.inbox;
+    cx.counters = image.counters;
+    if let Some(turn) = image.suspended_turn { cx.inbox.resume_turn(turn); }
 
-    // 3. Become the consumer of the agent's queue. Messages sent while it was
-    //    quiesced or crashed are waiting there and are pulled by the driver as usual.
-    cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&id).await?;
-    cx.log.sync().await?;
-
+    cx.log.append(Event::Thawed { host: rt.host_id(), epoch: cx.log.epoch() })?;
+    cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&cx.id).await?;
     cx.phase = Phase::Idle;
     Ok(rt.spawn_agent(cx))   // the Driver plugin's run() takes over
+}
+```
+
+`restore_slot` decodes the blob with its plugin, calling `Runner::migrate` first when the slot's version is older than the runner's. An image is missing no slots by construction, so thaw never replays events.
+
+### Crash recovery
+
+```rust
+/// Rebuild an agent that stopped without quiescing, from its log alone.
+pub async fn recover(rt: &Runtime, id: AgentId) -> Result<AgentHandle, RecoverError> {
+    let log = rt.log_store.open(&id, OpenMode::Recover).await?;   // raises the epoch
+    let header = log.read_header().await?;
+    let mut cx = AgentCtx::build(rt, &header.config, log).await?;
+
+    let snap = cx.log.latest_snapshot().await?;                   // periodic, if any
+    if let Some(snap) = &snap { cx.restore_partial(rt, snap)?; }
+    // Replay events after the snapshot (or from the start). Hooks see Replay and
+    // must not cause side effects.
+    for event in cx.log.events_after(snap.map(|s| s.offset)).await? {
+        cx.fold(&event);                                  // history, inbox, counters, phase
+        dispatch(&mut cx, Hook::Replay(&event)).await?;   // [hook] replay
+    }
+
+    if let Tail::Crashed { dangling, .. } = classify_tail(&cx.log) {
+        repair_crash(&mut cx, dangling)?;
+        if header.config.resume.after_crash.should_continue(&cx.counters) { // [config]
+            cx.inbox.push_next_turn(Input::system(RESTARTED_NOTICE), &mut cx.log)?;
+        }
+    }
+    cx.log.sync().await?;
+
+    cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&id).await?;
+    cx.phase = Phase::Idle;
+    Ok(rt.spawn_agent(cx))
 }
 
 fn repair_crash(cx: &mut AgentCtx, dangling: Vec<DanglingCall>) -> Result<(), DriverError> {
@@ -579,13 +610,11 @@ fn repair_crash(cx: &mut AgentCtx, dangling: Vec<DanglingCall>) -> Result<(), Dr
 }
 ```
 
-`restore_slots` decodes each slot with its plugin, calling `Runner::migrate` first when the slot's version is older than the runner's. With `Completeness::Full` a missing slot is an error, because the quiesce snapshot promised every slot; with `Partial`, derived slots are rebuilt by replay.
-
-The crash branch uses DeepSeek's honest wording for an interrupted tool and opencode's optional automatic continuation with a resume cap. Whether a crashed turn continues by itself is the per-agent `resume.after_crash` setting: `wait` or `continue { max }`. It is a required field with no implicit default, so each deployment decides.
+Recovery uses DeepSeek's honest wording for an interrupted tool and opencode's optional automatic continuation with a resume cap. Whether a crashed turn continues by itself is the per-agent `resume.after_crash` setting: `wait` or `continue { max }`. It is a required field with no implicit default, so each deployment decides. If an agent crashed while quiescing, before its image was handed over, it is recovered from the log like any other crash.
 
 ### Changing configuration
 
-Configuration is pinned in the header, so a resumed agent behaves the way it did before. Changing it is a `Reconfigure` command. The driver applies it at the next safe point by appending a `Reconfigured { patch }` event and reloading the affected plugins; new plugin instances receive their state through `migrate` or start fresh, as their runner decides. Because the patch is in the log, a later resume replays it, and anything it changes in the model's input is reconstructible.
+Configuration is pinned in the header and carried in every image, so a thawed or recovered agent behaves the way it did before. Changing it is a `Reconfigure` command. The driver applies it at the next safe point by appending a `Reconfigured { patch }` event and reloading the affected plugins; new plugin instances receive their state through `migrate` or start fresh, as their runner decides. Because the patch is in the log, recovery replays it, and anything it changes in the model's input is reconstructible.
 
 ### Side effects outside the log
 
@@ -597,12 +626,12 @@ None of the three surveyed harnesses can finish the current step or turn and the
 
 ```rust
 pub enum DrainPoint {
-    Step,       // stop at the next step boundary; the turn is suspended and continues on resume
+    Step,       // stop at the next step boundary; the turn is suspended and continues on thaw
     Turn,       // let the current turn finish; stop before the next one
     Immediate,  // cancel the current step now; the log is closed like a cancel, then quiesced
 }
 
-pub enum DrainResult { Quiesced { at: LogOffset }, DeadlineHit { forced: bool }, Closed }
+pub enum DrainResult { Quiesced { image: AgentImage, forced: bool }, Closed }
 ```
 
 What happens on `Command::Drain { at, deadline }`:
@@ -610,33 +639,34 @@ What happens on `Command::Drain { at, deadline }`:
 1. The phase becomes `Draining`. The agent stops pulling from its queue, so new messages wait there, and no new turn starts.
 2. `drain_requested` is dispatched. Plugins that own background work (jobs, subagents, schedulers) stop admitting new work and report what must finish first. A subagent is itself an agent, so the parent drains its children with the same command.
 3. The driver runs until the requested safe point. A step that is waiting on a tool keeps waiting until the tool finishes or the deadline passes.
-4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. It also detaches from its queue, which leaves every unpulled message for whichever host resumes the agent.
-5. If the deadline passes first, the driver falls back to `Immediate`: it cancels running tool bodies through their child tokens, writes "not run" or "outcome unknown" results the same way crash repair would, and then quiesces. The result reports `DeadlineHit { forced: true }` so the operator knows the stop was not clean.
+4. At the safe point the driver appends `Quiesced`, syncs the log, serializes the context into an `AgentImage`, releases the log lease, detaches from its queue (leaving every unpulled message for whoever thaws the agent), and returns `Exit::Quiesced`. The handle's waiters receive the image.
+5. If the deadline passes first, the driver falls back to `Immediate`: it cancels running tool bodies through their child tokens, writes "not run" or "outcome unknown" results the same way crash repair would, and then quiesces. The result carries `forced: true` so the operator knows the stop was not clean.
 
 ```rust
 async fn settle_drain(cx: &mut AgentCtx, here: DrainPoint) -> Result<Option<Exit>, DriverError> {
     let Phase::Draining { at, deadline, .. } = &cx.phase else { return Ok(None) };
-    if !(here.satisfies(*at) || Instant::now() >= *deadline) { return Ok(None); }
+    let forced = Instant::now() >= *deadline;
+    if !(here.satisfies(*at) || forced) { return Ok(None); }
 
-    let snapshot = write_snapshot(cx, Completeness::Full).await?;  // every slot and the inbox
-    cx.log.append(Event::Quiesced {
-        snapshot: snapshot.offset,
-        at: here,
-        suspended_turn: cx.current_turn_if_suspended(),
-        inbox_len: cx.inbox.len(),
-    })?;
+    let suspended_turn = cx.current_turn_if_suspended();
+    cx.log.append(Event::Quiesced { at: here, suspended_turn })?;
     cx.log.sync().await?;
+
+    dispatch(cx, Hook::Snapshot).await?;              // [hook] opaque plugin state into slots
+    let image = cx.to_image(suspended_turn)?;         // every slot, history, inbox, counters, log position
     cx.log.release_lease().await?;
-    cx.queue.detach().await?;                     // unpulled messages stay for the next consumer
+    cx.queue.detach().await?;                         // unpulled messages stay for the next consumer
     cx.phase = Phase::Quiesced;
-    cx.notify_drain_waiters(DrainResult::Quiesced { at: cx.log.offset() });
+    cx.notify_drain_waiters(DrainResult::Quiesced { image, forced });
     Ok(Some(Exit::Quiesced))
 }
 ```
 
-A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, attaches to the queue, and continues any suspended turn with no repair and no user message.
+What the caller does with the image is outside the harness: write it to local disk for a restart on the same host, or hand it to whatever moves agents between hosts.
 
-**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages sent meanwhile wait in its queue. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
+A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, collects the images, hands them to its configured image sink, and exits. Starting again is `thaw` on each image, which continues any suspended turn with no repair and no user message.
+
+**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent appends `Parked { waiting_on }`, produces an image, and its task exits; messages sent meanwhile wait in its queue. An `Answer` command for that request makes the runtime thaw the image and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is thawed, on this host or another.
 
 ## Message queue
 
@@ -692,33 +722,38 @@ Duplicates sent by senders themselves, such as a client retrying a send, are the
 
 ## Migrating an agent between hosts
 
-Resizing a cluster moves agents by quiescing them on one host and resuming them on another. Because messages wait in the shared queue and the log is on a backend both hosts can reach, the move needs no step of its own.
+Resizing a cluster moves agents by quiescing them on one host and thawing them on another. Messages wait in the shared queue and the log store is reachable from every host, so the move is only the image changing hands.
 
 1. Host A is running the agent and pulling from its queue.
 2. The orchestrator sends `Drain { at, deadline }` to the agent on A. It stops pulling and runs to the safe point.
-3. A writes the complete snapshot and `Quiesced`, releases the store lease, and detaches from the queue. Messages sent from now on wait in the queue.
-4. The orchestrator calls `resume` on host B. B opens the store (raising the epoch), rebuilds the context from the snapshot, attaches to the queue and runs. It continues any suspended turn, then pulls the messages that arrived during the move, in queue order.
-5. Host A can be torn down at any point after step 3.
+3. A appends `Quiesced` to the log, serializes the context into an image, releases the log, and detaches from the queue. Messages sent from now on wait in the queue.
+4. The image is transferred to host B. How is outside the harness.
+5. B calls `thaw(image)`. It takes ownership of the log (raising the epoch), rebuilds the context from the image, attaches to the queue and runs. It continues any suspended turn, then pulls the messages that arrived during the move.
+6. Host A can be torn down at any point after step 3.
 
 ```rust
 /// Orchestrator side. Each call is idempotent so the move can be retried.
 async fn migrate(id: AgentId, a: &HostClient, b: &HostClient, cfg: &MigrationConfig) -> Result<(), MigrateError> {
-    a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;   // steps 2-3
-    b.resume(id).await?;                                       // step 4
+    let image = a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;   // steps 2-3
+    b.thaw(image).await?;                                                  // steps 4-5
     Ok(())
 }
 ```
 
-If B fails during resume, the orchestrator resumes the agent on another host; the epoch rises again and nothing on B can write. If A never finished quiescing (it crashed), B's `resume` takes the slow path and repairs the log as after any crash.
+The image records the log position it is consistent with, and thaw refuses to continue a log that has moved past it, so an out-of-date image can never fork the conversation. If B fails during thaw, the same image can be thawed on another host; the epoch rises again and nothing on B can append. If A crashed before producing an image, any host can `recover` the agent from its log.
 
 ## Creating an agent
 
-Every agent's configuration is plugin-supplied, which raises the question of where the first configuration comes from. The answer is one runtime-level plugin, the **provisioner**, named in the process's startup file together with the runners the process offers. That file is the only configuration that is not produced by a plugin.
+Every agent's configuration is plugin-supplied, which raises the question of where the first configuration comes from. The answer is one runtime-level plugin, the **provisioner**, named in the process's startup file together with the runners the process offers. It also names the log store, which is part of the hosting infrastructure in the same way. That file is the only configuration that is not produced by a plugin.
 
 ```toml
 # runtime.toml: read once at process start
 [runners]
 enable = ["builtin.*", "wasm", "process.python", "mcp"]
+
+[log_store]
+runner = "builtin.logstore.s3"
+code.inline = { bucket = "agent-logs", prefix = "{tenant}/{agent}" }
 
 [provisioner]
 runner = "process.python"
@@ -732,8 +767,6 @@ grants = { hosts = ["tenants.internal"], secrets = ["secret://platform/tenant-db
 pub trait Provisioner: Plugin {
     /// Produce everything needed to build a new agent.
     async fn provision(&self, req: CreateRequest) -> Result<AgentSpec, ProvisionError>;
-    /// Where an existing agent's log lives, so any host can resume it.
-    async fn locate(&self, id: &AgentId) -> Result<StoreLocator, ProvisionError>;
 }
 
 pub struct CreateRequest {
@@ -745,23 +778,21 @@ pub struct CreateRequest {
 pub struct AgentSpec {
     pub id: AgentId,
     pub config: AgentConfig,                     // every plugin: runner, code, grants
-    pub locator: StoreLocator,                   // where the log will live
     pub initial_state: Vec<(PluginId, StateBlob)>,
     pub initial_events: Vec<Event>,              // e.g. seed instructions or a first message
 }
 
 pub async fn create(rt: &Runtime, req: CreateRequest) -> Result<AgentHandle, CreateError> {
     let spec = rt.provisioner.provision(req).await?;
-    let store = rt.open_store(&spec.locator, LeaseMode::CreateExclusive).await?;  // fails if it exists
+    let log = rt.log_store.open(&spec.id, OpenMode::Create).await?;   // fails if the agent exists
 
-    // Same build path as resume: load every plugin through its runner.
-    let mut cx = AgentCtx::build(rt, &spec.config, store).await?;
+    // Same build path as thaw and recovery: load every plugin through its runner.
+    let mut cx = AgentCtx::build(rt, &spec.config, log).await?;
     cx.log.write_header(&spec.config)?;
     for (pid, blob) in spec.initial_state {
         cx.state.insert(&pid, cx.plugins[&pid].decode_state(blob)?);
     }
-    for event in spec.initial_events { cx.log.append(event)?; }
-    write_snapshot(&mut cx, Completeness::Full).await?;
+    for event in spec.initial_events { cx.log.append(event)?; }       // also updates history
     cx.log.sync().await?;
 
     cx.queue = cx.plugins.service::<dyn MessageQueue>()?.attach(&cx.id).await?;
@@ -770,9 +801,9 @@ pub async fn create(rt: &Runtime, req: CreateRequest) -> Result<AgentHandle, Cre
 }
 ```
 
-The provisioner is consulted once per agent. After `create`, the agent's configuration lives in its own log header, and every later start, on any host, rebuilds the context from that header without calling `provision` again; only `locate` is used, to find the log. A configuration change after creation is a `Reconfigure` command, which the provisioner can issue like any other caller, and which is logged so that a resume replays it.
+The provisioner is consulted once per agent. After `create`, the agent's configuration travels in its images and is pinned in its log header, so thaw and recovery never call the provisioner. A configuration change after creation is a `Reconfigure` command, which the provisioner can issue like any other caller, and which is logged and carried in later images.
 
-Because the provisioner is a plugin like any other, it can be as simple or as elaborate as a deployment needs: `builtin.provisioner.templates` whose code is a directory of TOML templates with tenant variables filled in, or a `process.python` application that reads tenant settings from a database. A provisioner that is unavailable stops new agents from being created and agents from being located, but it does not affect agents that are already running.
+Because the provisioner is a plugin like any other, it can be as simple or as elaborate as a deployment needs: `builtin.provisioner.templates` whose code is a directory of TOML templates with tenant variables filled in, or a `process.python` application that reads tenant settings from a database. A provisioner that is unavailable stops new agents from being created, but it does not affect running, quiescing or thawing agents.
 
 ## Isolation in a multi-tenant process
 
@@ -792,7 +823,7 @@ Isolation has four layers, from the language up to the operating system.
 
 ## Worked example
 
-Two agents in the same process, owned by different tenants and configured differently. Each is one TOML document, as a provisioner might return it; the runtime records it in the agent's log header at creation.
+Two agents in the same process, owned by different tenants and configured differently. Each is one TOML document, as a provisioner might return it; the runtime records it in the agent's log header at creation. Neither names a log store, because that is set once for the process.
 
 ```toml
 # Agent A: a coding agent with only built-in plugins.
@@ -811,10 +842,8 @@ runner = "builtin.model.openai-compat"
 code.inline = { base_url = "https://api.example.com/v1", model = "coder-large" }
 grants = { secrets = ["secret://acme/model-key"], hosts = ["api.example.com"] }
 
-[[plugin]]
-id = "store"
-runner = "builtin.store.jsonl"
-code.inline = { snapshot_every_steps = 20 }
+[snapshot]
+every_steps = 20   # periodic snapshots, to shorten crash recovery for long sessions
 
 [[plugin]]
 id = "queue"
@@ -855,11 +884,6 @@ code.inline = { base_url = "https://llm.globex.internal/v1", model = "support-sm
 grants = { secrets = ["secret://globex/model-key"], hosts = ["llm.globex.internal"] }
 
 [[plugin]]
-id = "store"
-runner = "builtin.store.sqlite"
-code.inline = { path = "/data/globex/sessions.db" }
-
-[[plugin]]
 id = "triage"
 runner = "process.python"
 code.package = { name = "globex-triage", version = "2.3.1", digest = "sha256:9f2c..." }
@@ -883,9 +907,9 @@ grants = { hosts = ["queue.globex.internal"] }
 What the loop does with B's Python plugin:
 
 - At creation, the `process.python` runner fetches the package by digest, starts a child process for this agent, and asks it which hooks it handles. It may subscribe only to the granted hooks; anything else fails creation.
-- On `pre_step`, the runner sends the step input as JSON. The Python code returns context to add (for example, the customer's open tickets); the runner appends it as an event, so the model sees it and a resume reproduces it.
+- On `pre_step`, the runner sends the step input as JSON. The Python code returns context to add (for example, the customer's open tickets); the runner appends it as an event, so the model sees it and crash recovery reproduces it.
 - On `tool_pre` for `open_ticket`, the Python code returns `ask`, so the driver asks a human and the agent parks until the answer arrives.
-- On `snapshot`, the Python code returns its own state as JSON, which goes into B's snapshot record. On resume, a new child process receives it before any events are replayed.
+- On `snapshot`, the Python code returns its own state as JSON, which goes into the agent's image. On thaw, a new child process, possibly on another host, receives it before the agent runs.
 - If the Python process dies, the runner reports a `PluginError` on the next hook, which fails B's current turn; A is unaffected.
 
 ## Decisions and open questions
@@ -893,18 +917,16 @@ What the loop does with B's Python plugin:
 Decided after review of the first draft:
 
 1. **Behavior after a crash is configuration.** `resume.after_crash` is a required per-agent field, `wait` or `continue { max }`, with no implicit default.
-2. **Crash resume replays the log; quiesce resume does not.** Periodic snapshots are optional and off by default, since a slower resume after a crash is acceptable. The quiesce snapshot is complete, so a quiesced agent is rebuilt from it alone; messages sent meanwhile are still in the queue.
+2. **Crash recovery replays the log; thaw does not.** Periodic snapshots are optional and off by default, since slower recovery after a crash is acceptable. Quiesce serializes the whole context into an image, and thaw rebuilds the agent from that image alone; messages sent meanwhile are still in the queue.
 3. **One hook definition for every non-Rust runner.** The hooks are defined once as WIT, and the JSON-RPC schema for `process` runners and the Rust bindings are generated from it.
 4. **`process` plugins run one process per agent.**
 5. **A drain does not deny pending approvals.** A parked agent stays parked through a quiesce or a move, and the request is still waiting when it resumes.
-6. **Storage backends are configurable** through the `SessionStore` plugin, per agent.
-7. **Inbound messages wait in a shared queue, provided by a plugin.** An agent pulls only when it can use a message, so nothing arrives while it is quiesced, and moving it between hosts is a quiesce and a resume.
+6. **The log store is hosting infrastructure.** It is a runtime-level plugin named in the process's startup file, the same for every tenant, and need not be local.
+7. **Inbound messages wait in a shared queue, provided by a plugin.** An agent pulls only when it can use a message, so nothing arrives while it is quiesced, and moving it between hosts is a quiesce, a transfer of the image, and a thaw.
 8. **Messages are used in queue order.** The agent never sorts or reorders them. Each message carries the time it was sent, which is logged for diagnosis but not used for ordering.
 9. **New agents come from a provisioner plugin** named in the process's startup file. After creation, an agent is rebuilt from its own log.
 
-Still open:
-
-1. **Provisioner availability.** Resuming an agent needs `locate`. A deterministic locator (the log's location derived from the agent id) removes that dependency; a directory lookup is more flexible but makes the provisioner part of every resume.
+Nothing is open from the review so far.
 
 ## What this borrows
 
