@@ -1,0 +1,6 @@
+/target/
+# Real host configs hold API keys; only examples/host.example.yaml is committed.
+/host.yaml
+/*.local.yaml
+# Logs, queues, images and agent workspaces written by the local host.
+/data/

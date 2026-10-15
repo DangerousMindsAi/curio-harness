@@ -1,0 +1,63 @@
+# A general assistant on DeepInfra with a workspace it can read, write and run commands in.
+# Start it with: cargo run -p curio-host -- chat assistant
+id: assistant
+tenant: local
+
+# A turn the host's crash interrupted is closed; set `after_crash: continue` with
+# `max_resumes: N` to have the agent pick it up again by itself.
+resume: { after_crash: wait }
+
+plugins:
+  - id: driver
+    runner: builtin.driver.react
+    code:
+      model: model                 # the plugin below
+      max_steps_per_turn: 40
+      max_forced_continuations: 3
+      max_parallel_tools: 4
+      tool_timeout_secs: 120
+
+  - id: model
+    runner: builtin.model.openai-compat
+    code:
+      base_url: https://api.deepinfra.com/v1/openai
+      model: deepseek-ai/DeepSeek-V3.2   # any chat model id from deepinfra.com/models
+      api_key_secret: deepinfra          # resolved from the host's secret store
+    grants:
+      hosts: [api.deepinfra.com]
+      secrets: [deepinfra]
+
+  - id: queue
+    runner: builtin.queue.file
+    code: { dir: data/queues }
+
+  - id: instructions
+    runner: builtin.instructions
+    code:
+      text: |
+        You are a helpful assistant running in curio-harness. You have a workspace
+        directory you can read, write and run shell commands in. Be concise.
+
+  - id: retry
+    runner: builtin.retry
+    code: { max_retries: 4, base_delay_ms: 1000 }
+
+  # The shell is not sandboxed, so every command needs your approval.
+  - id: approval
+    runner: builtin.approval
+    code: { ask: [shell] }
+
+  - id: clock
+    runner: builtin.tool.clock
+
+  - id: read_file
+    runner: builtin.tool.read_file
+    grants: { fs: [data/workspaces/assistant] }
+
+  - id: write_file
+    runner: builtin.tool.write_file
+    grants: { fs: [data/workspaces/assistant] }
+
+  - id: shell
+    runner: builtin.tool.shell
+    grants: { fs: [data/workspaces/assistant] }
