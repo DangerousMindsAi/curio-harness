@@ -39,7 +39,7 @@ Checkpointing is event-sourced. The log is forced to disk before every model req
 
 Quiesce is a first-class phase. A drain request stops new work from being admitted, lets the agent reach a chosen safe point (end of step or end of turn), writes a complete snapshot and a `Quiesced` marker, and releases the session. A quiesced agent resumes exactly where it stopped, from the snapshot alone, with no replay, no repair and no user message needed. None of the three surveyed harnesses can do this.
 
-Quiesce is also how agents move between hosts when a cluster is resized. Every inbound message carries a sender-assigned timestamp and a checksum; the agent keeps pending messages sorted by that pair and drops duplicates, so messages that arrive while the agent is quiesced, arrive at both the old and the new host, or are forwarded twice are all admitted exactly once and in the same order. A fencing epoch on the session store guarantees that only one host can write to the agent at a time. The move is invisible to senders.
+Quiesce is also how agents move between hosts when a cluster is resized. Every inbound message carries a sender-assigned timestamp and a checksum; the agent keeps pending messages sorted by that pair and drops duplicates, so messages that arrive while the agent is quiesced, arrive at both the old and the new host, or are forwarded twice are all admitted exactly once and in the same order. Messages always land first in a durable per-agent mailbox that lives outside the agent's context, so the same path serves a running agent, a quiesced one and one in the middle of a move. A fencing epoch on the session store guarantees that only one host can write to the agent at a time. The move is invisible to senders.
 
 ## Requirements and where each is met
 
@@ -66,7 +66,7 @@ Quiesce is also how agents move between hosts when a cluster is resized. Every i
 - **Turn / step / attempt**: as in DeepSeek. A turn answers one input; a step is one model request plus its tools; an attempt is one try at the request.
 - **Safe point**: a moment where the agent's state is consistent and can be snapshotted or quiesced: before a step starts, or after a turn ends.
 - **Envelope**: the wrapper on every inbound message, carrying a sender-assigned timestamp and a checksum. The pair `(timestamp, checksum)` is the message's sort key, and the checksum is its identity for deduplication.
-- **Spool**: a durable, append-only file of envelopes kept by a host for an agent that is not running there. Appending needs no lease.
+- **Mailbox**: a durable, append-only queue of envelopes that a host keeps for each agent it receives messages for. Every inbound message is appended there first, whether the agent is running, quiesced or gone. Appending needs no lease, and the mailbox is not part of `AgentCtx`.
 - **Epoch**: a counter on the agent's session store that increases each time a host takes ownership. Writes carrying an older epoch are refused.
 - **Thaw**: loading a quiesced agent's snapshot on a host and taking ownership, without starting to run it.
 
@@ -78,8 +78,8 @@ process
     ├── RunnerRegistry: kind -> Arc<dyn Runner>
     ├── StoreBackends:  where session logs live (files, SQLite, object store)
     ├── Scheduler:      per-tenant quotas, admission, fair sharing of model/tool slots
-    ├── Ingress:        receives envelopes; routes to a live agent or appends to its spool
-    ├── Spools:         AgentId -> durable spool, for agents quiesced on or moving off this host
+    ├── Ingress:        receives envelopes, appends each to the agent's mailbox, rings its doorbell
+    ├── Mailboxes:      AgentId -> durable mailbox (backend configurable); one consumer each
     └── agents: AgentId -> AgentHandle      (a channel sender, no state)
 
 agent task (one per live agent, owns everything below)
@@ -99,8 +99,7 @@ Outside callers talk to an agent only through its `AgentHandle`:
 
 ```rust
 pub enum Command {
-    Send { envelope: Envelope },                     // see Inbound messages; delivery is inside
-    Merge { envelopes: Vec<Envelope> },              // a batch forwarded from another host's spool
+    Mail,                                            // doorbell: the mailbox has new envelopes
     Cancel { reason: CancelReason },                 // abort the current turn
     Drain { at: DrainPoint, deadline: Instant, reply: oneshot::Sender<DrainResult> },
     Answer { request: RequestId, answer: Answer },   // approval or question from a plugin
@@ -291,7 +290,7 @@ This is the default `Driver` plugin, `builtin.react-driver`. Lines marked `// [h
 async fn run(&self, cx: &mut AgentCtx) -> Result<Exit, DriverError> {
     dispatch(cx, Hook::AgentLoaded).await?;                       // [hook] agent_loaded
     loop {
-        cx.apply_pending_commands()?;          // Send, Merge, Cancel, Drain, Answer, Reconfigure, Release
+        cx.apply_pending_commands()?;          // Mail, Cancel, Drain, Answer, Reconfigure, Release
 
         // Thawed: owned on this host and accepting messages, but not running until Release.
         if let Phase::Thawed { .. } = cx.phase {
@@ -491,7 +490,7 @@ There are two kinds of snapshot, because crash recovery and quiesce have differe
 | Before each model request | The request can be rebuilt exactly; a crash during streaming loses only the partial reply |
 | Before each tool body (`ToolStarted`) | Resume can tell "might have run" from "never ran" ([crash recovery note 2](../crash-recovery/README.md#notes-for-curio-harness)) |
 | End of each turn | A finished turn is never lost |
-| Message admission | A message the sender has been told was received is never lost |
+| Mailbox append, and before each mailbox truncate | A message the sender has been told was received is never lost |
 | At quiesce | The agent can be resumed from the snapshot with no replay or repair |
 
 Between save points the `SessionStore` plugin may batch writes. Periodic snapshots are an optimization for crash-resume time and never needed for correctness: resume from the header and the full event stream gives the same context. The quiesce snapshot is the exception, since a thawed agent is built from it directly.
@@ -548,10 +547,10 @@ pub async fn resume(rt: &Runtime, id: AgentId, start: StartMode)
         }
     }
 
-    // 3. Pull in anything this host spooled for the agent while it was not running here.
-    for env in rt.spools.drain(&id).await? {
-        cx.inbox.offer(env);                     // sorted insert; duplicates dropped
-    }
+    // 3. Become the consumer of this host's mailbox for the agent, and take in what
+    //    arrived while it was not running here: the same call a running agent makes.
+    cx.mailbox = rt.mailboxes.attach(&id, Consumer::Agent).await?;
+    consume_mailbox(&mut cx).await?;
     cx.log.sync().await?;
 
     // 4. Run now, or stay thawed (owned, accepting messages, not running) until Release.
@@ -610,7 +609,7 @@ What happens on `Command::Drain { at, deadline }`:
 1. The phase becomes `Draining`. New messages are still accepted, logged and acknowledged, so nothing a sender sends is lost, but no new turn starts.
 2. `drain_requested` is dispatched. Plugins that own background work (jobs, subagents, schedulers) stop admitting new work and report what must finish first. A subagent is itself an agent, so the parent drains its children with the same command.
 3. The driver runs until the requested safe point. A step that is waiting on a tool keeps waiting until the tool finishes or the deadline passes.
-4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. From this moment the host's ingress appends messages for the agent to its spool instead of a live inbox.
+4. At the safe point the driver writes a complete snapshot, appends `Quiesced { at, suspended_turn }`, syncs, releases the lease, and returns `Exit::Quiesced`. The handle's waiters receive `DrainResult::Quiesced`. The mailbox is untouched: messages keep arriving there exactly as before, and simply wait for the next consumer.
 5. If the deadline passes first, the driver falls back to `Immediate`: it cancels running tool bodies through their child tokens, writes "not run" or "outcome unknown" results the same way crash repair would, and then quiesces. The result reports `DeadlineHit { forced: true }` so the operator knows the stop was not clean.
 
 ```rust
@@ -627,16 +626,16 @@ async fn settle_drain(cx: &mut AgentCtx, here: DrainPoint) -> Result<Option<Exit
     })?;
     cx.log.sync().await?;
     cx.log.release_lease().await?;
-    cx.runtime().ingress.route_to_spool(cx.id);   // later messages go to this host's spool
+    cx.mailbox.detach().await?;                   // messages keep landing; nobody consumes them
     cx.phase = Phase::Quiesced;
     cx.notify_drain_waiters(DrainResult::Quiesced { at: cx.log.offset() });
     Ok(Some(Exit::Quiesced))
 }
 ```
 
-A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, merges the spool, and continues any suspended turn with no repair and no user message.
+A process-level graceful shutdown is then a drain of every agent with one deadline: on SIGTERM the runtime sends `Drain { at: Turn, deadline }` to all handles, waits for the results, and exits. Resuming later is ordinary `resume`, which takes the fast path from the quiesce snapshot, consumes the mailbox, and continues any suspended turn with no repair and no user message.
 
-**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages that arrive meanwhile go to the spool. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
+**Parking.** The same mechanism lets the runtime evict an agent that is waiting on something slow, such as a human approval in `tool_pre`. The agent writes a complete snapshot, appends `Parked { waiting_on }`, and its task exits; messages that arrive meanwhile wait in its mailbox. An `Answer` command for that request makes the runtime resume it and deliver the answer. In a multi-tenant process this keeps memory proportional to agents that are doing work rather than agents that exist. If a drain reaches an agent that is parked, it stays parked: the pending request is neither denied nor answered, and it is still waiting when the agent is resumed, on this host or another.
 
 ## Inbound messages
 
@@ -659,33 +658,64 @@ impl Envelope {
 
 Two rules make deduplication work across hosts. The timestamp is assigned before the message is routed, never by the receiving host, so two copies of one message that reach different hosts are identical and have the same checksum. And the checksum covers the sender, the timestamp and the body, so two different messages with the same timestamp still sort deterministically and are not mistaken for each other. A sender that means to send the same text twice at the same instant must make the envelopes differ, for example with a sequence number in the body.
 
-The inbox keeps two structures:
+Delivery has two halves, and only the second is part of the agent's state.
+
+1. **The mailbox** belongs to the host runtime, not to `AgentCtx`. Ingress appends every envelope to the agent's mailbox, syncs it, acknowledges the sender, and rings the agent's doorbell if it is running on this host. It does not check for duplicates or order, and it does not care whether the agent is running, quiesced, parked or already moved away.
+2. **The inbox** is in `AgentCtx`. It holds the messages the agent has taken in but not yet used, sorted and deduplicated, plus the checksums of messages it took in recently. It is written to the session log and to snapshots like the rest of the context.
+
+The mailbox is to the agent what a socket's receive buffer is to a process: bytes that have arrived but have not been read. Keeping it outside the context is what lets messages arrive while no context exists, and it does not weaken isolation, because each agent has its own mailbox and nothing but its single consumer reads it.
 
 ```rust
+/// Host-side, durable, one per agent. Backend chosen in runtime config (local file, SQLite, a queue).
+pub trait Mailbox: Send + Sync {
+    /// Append and sync. Ingress acknowledges the sender only after this returns.
+    async fn append(&self, env: Envelope) -> Result<(), MailboxError>;
+    /// Read envelopes after `cursor`, oldest first. Only the attached consumer calls this.
+    async fn read(&self, cursor: Cursor, max: usize) -> Result<(Vec<Envelope>, Cursor), MailboxError>;
+    /// Drop everything up to `cursor`. Called only after the consumer has made those envelopes durable elsewhere.
+    async fn truncate(&self, upto: Cursor) -> Result<(), MailboxError>;
+}
+
+/// Exactly one consumer is attached to a mailbox at a time.
+pub enum Consumer {
+    Agent,                     // the agent's own task on this host
+    Forwarder { to: HostId },  // during a move: re-appends each envelope to the new host's mailbox
+}
+
 pub struct Inbox {
-    pending: BTreeMap<(Timestamp, Digest), Envelope>,  // received, not yet taken into a turn or step
-    seen: SeenSet,                                     // checksums of every envelope received, within the horizon
+    pending: BTreeMap<(Timestamp, Digest), Envelope>,  // taken in, not yet used by a turn or step
+    seen: SeenSet,                                     // checksums taken in during the last dedupe_horizon only
     next_step: Vec<Input>,                             // claimed for the current turn's next step
-    newest: Timestamp,                                 // newest sent_at ever received
+    newest: Timestamp,                                 // newest sent_at ever taken in
+}
+
+/// Run by the agent at every safe point, on a doorbell while idle or thawed, and on resume.
+async fn consume_mailbox(cx: &mut AgentCtx) -> Result<(), DriverError> {
+    let (batch, upto) = cx.mailbox.read(cx.mailbox_cursor, cx.config.inbox.batch).await?;
+    for env in batch {
+        match cx.inbox.offer(env, &cx.config.inbox) {
+            Offer::Accepted(env) => cx.log.append(Event::MessageReceived(env))?,
+            Offer::Duplicate => {}                                       // already taken in
+            Offer::Refused(env) => cx.log.append(Event::MessageRefused { checksum: env.checksum })?,
+        }
+    }
+    cx.log.sync().await?;              // the messages are durable in the agent's own log...
+    cx.mailbox.truncate(upto).await?;  // ...before they leave the mailbox
+    cx.mailbox_cursor = upto;
+    Ok(())
 }
 
 impl Inbox {
-    /// Called for every envelope, from a live Send, a spool on this host, or a Merge from another host.
-    fn offer(&mut self, env: Envelope, log: &mut SessionLog, cfg: &InboxConfig) -> Offer {
-        if self.seen.contains(&env.checksum) { return Offer::Duplicate; }  // already received: ack, drop
+    fn offer(&mut self, env: Envelope, cfg: &InboxConfig) -> Offer {
+        if self.seen.contains(&env.checksum) { return Offer::Duplicate; }
         if env.sent_at < self.newest - cfg.dedupe_horizon {               // [config]
             // Too old to prove it is not a duplicate whose record was pruned.
-            return match cfg.late_policy { LatePolicy::Refuse => Offer::Refused, LatePolicy::Admit => self.accept(env, log) };
+            if cfg.late_policy == LatePolicy::Refuse { return Offer::Refused(env); } // [config]
         }
-        self.accept(env, log)
-    }
-
-    fn accept(&mut self, env: Envelope, log: &mut SessionLog) -> Offer {
-        log.append(Event::MessageReceived(env.clone()));   // durable before the sender is acknowledged
         self.seen.insert(env.checksum, env.sent_at);
         self.newest = self.newest.max(env.sent_at);
-        self.pending.insert(env.key(), env);
-        Offer::Accepted
+        self.pending.insert(env.key(), env.clone());
+        Offer::Accepted(env)
     }
 
     /// The driver takes the earliest pending message for a new turn.
@@ -693,24 +723,30 @@ impl Inbox {
 }
 ```
 
-Ordering is defined over what has not yet been consumed. Pending messages are always taken in `(timestamp, checksum)` order, so it does not matter which host received a message first or in what order forwarded batches arrive. Once a message has been taken into a turn, its place in the conversation is fixed and logged. A message that arrives after a later-stamped message was already taken is still admitted, at the front of the pending set, and its log record is marked `late`. With the migration sequence below, this happens only to messages that the old host received after the new host was released, which a short forwarding window keeps rare.
+A crash between `sync` and `truncate` leaves envelopes in the mailbox that are already in the log. They are read again on resume and dropped as duplicates, so the order of those two calls is what makes consumption safe without a transaction across the two stores.
 
-The seen set is pruned by timestamp once entries fall outside `dedupe_horizon`, and it is part of every snapshot, so deduplication survives quiesce, crash and migration. Senders are expected to retry until acknowledged, and a host acknowledges only after the envelope is durable in the agent's log or in a spool. Retries plus deduplication give each message exactly one admission.
+Ordering is defined over what has not yet been used. Pending messages are always taken in `(timestamp, checksum)` order, so it does not matter which host received a message first or in what order forwarded batches arrive. Once a message has been taken into a turn, its place in the conversation is fixed and logged. A message that arrives after a later-stamped message was already used is still taken in, at the front of the pending set, and its log record is marked `late`. With the migration sequence below, this happens only to messages that reach the old host after the new host was released, which a short forwarding window keeps rare.
+
+The seen set does not grow with the conversation. It only needs to remember a message for as long as another copy of that message could still be in flight, so it is pruned by timestamp to a window of `dedupe_horizon` behind the newest message taken in. Messages that are still pending need no entry of their own, since the pending map already catches their duplicates. Copies are in flight only during a sender's retries and while a forwarder is draining an old host's mailbox, so the horizon should cover the longest of those (the sender's retry limit, or the migration's `forward_grace`) and is minutes, not hours. At one message a second and a ten-minute horizon that is 600 entries of about 40 bytes, roughly 24 KB per agent. The set is part of every snapshot, so deduplication survives quiesce, crash and migration, and anything older than the horizon is handled by `late_policy`.
+
+If senders can attach a sequence number, a smaller structure is possible: per sender, the highest sequence number taken in plus any gaps below it. Its size depends on the number of senders rather than the message rate, but it requires every sender to number its messages, so it is an option for later rather than the default. Senders are expected to retry until acknowledged, and a host acknowledges only after the envelope is durable in a mailbox. Retries plus deduplication give each message exactly one admission.
 
 ## Migrating an agent between hosts
 
 Resizing a cluster moves agents by quiescing them on one host and resuming them on another. The orchestrator drives the sequence; the agent's own behavior is unchanged, and nothing the model sees records the move. The sequence below follows the eight steps in the requirements.
 
+The mailbox makes migration a change of consumer. On A, the consumer of the agent's mailbox goes from the agent, to nobody, to a forwarder that re-appends each envelope to B's mailbox. On B, the agent attaches as the consumer of its own mailbox when it is thawed. Nothing in the delivery path is specific to migration.
+
 | Step | Host A | Host B | Session store |
 |---|---|---|---|
-| 1. Running on A | Agent runs; messages go straight to its inbox | | Epoch `n`, owned by A |
-| 2. Quiesce requested | `Drain { at, deadline }`; messages still logged into the inbox | | |
-| 3. Quiescing and quiesced | Reaches the safe point, writes the complete snapshot and `Quiesced`, releases the lease; later messages go to A's spool | | Unowned; ends with `Quiesced` |
-| 4. Thawed on B | | `resume(id, StartMode::Thawed)`: opens the store, restores the snapshot, appends `Thawed`; phase `Thawed` | Epoch `n+1`, owned by B |
-| 5. Messages arrive at both | Spooled | Offered to the inbox: logged, sorted, deduplicated; no turn runs | |
-| 6. A's messages added to B | Forwards its spool to B as `Merge` batches; deletes each batch only after B acknowledges it | Offers each envelope; duplicates are dropped | |
-| 7. B restarts the agent | Keeps forwarding anything new | `Release`: phase becomes `Idle`; the suspended turn continues, then pending messages run in key order | |
-| 8. A torn down | Stops acknowledging (senders retry against B), forwards its final batch, waits for the acknowledgment, deletes the spool | | |
+| 1. Running on A | Messages land in A's mailbox; the agent consumes them | | Epoch `n`, owned by A |
+| 2. Quiesce requested | `Drain { at, deadline }`; the agent keeps consuming until it reaches the safe point | | |
+| 3. Quiescing and quiesced | Writes the complete snapshot and `Quiesced`, releases the lease, detaches; messages keep landing in A's mailbox | | Unowned; ends with `Quiesced` |
+| 4. Thawed on B | | `resume(id, StartMode::Thawed)`: opens the store, restores the snapshot, appends `Thawed`, attaches to B's mailbox; phase `Thawed` | Epoch `n+1`, owned by B |
+| 5. Messages arrive at both | Land in A's mailbox | Land in B's mailbox; the thawed agent consumes them (sorted, deduplicated) but runs no turn | |
+| 6. A's messages added to B | A forwarder attaches to A's mailbox and appends each envelope to B's mailbox, truncating only after B's append succeeds | Consumed like any other message; duplicates are dropped | |
+| 7. B restarts the agent | Forwarder keeps running | `Release`: phase becomes `Idle`; the suspended turn continues, then pending messages run in key order | |
+| 8. A torn down | Ingress stops acknowledging (senders retry against B); the forwarder empties the mailbox; the mailbox is deleted | | |
 
 ```rust
 /// Orchestrator side. Each call is idempotent so the whole sequence can be retried.
@@ -718,21 +754,23 @@ async fn migrate(id: AgentId, a: &HostClient, b: &HostClient, cfg: &MigrationCon
     a.drain(id, cfg.drain_point, cfg.drain_deadline).await?;          // steps 2-3
     b.thaw(id).await?;                                                // step 4
     cfg.directory.point(id, b.host()).await?;                         // step 5 begins as routes update
-    a.start_forwarding(id, b.host()).await?;                          // step 6, continues until teardown
-    a.wait_spool_drained_once(id).await?;                             // everything A held at this point is on B
+    a.attach_forwarder(id, b.host()).await?;                          // step 6, runs until teardown
+    a.wait_mailbox_empty_once(id).await?;                             // everything A held at this point is on B
     b.release(id).await?;                                             // step 7
     a.teardown_after(cfg.forward_grace).await?;                       // step 8
     Ok(())
 }
 ```
 
+With a mailbox backend that both hosts can reach (a shared queue, for example), A and B append to the same mailbox, no forwarder is needed, and steps 5 and 6 collapse into one. The agent code is the same either way.
+
 Three properties make the move transparent.
 
-1. **Nothing is lost.** Every message is durable before it is acknowledged, in A's log, A's spool or B's log, and A deletes spooled messages only after B has made them durable.
-2. **Nothing is admitted twice.** The seen set travels in the quiesce snapshot, so B recognizes messages A had already received, and any message delivered to both hosts or forwarded twice has one checksum.
-3. **Only one host writes.** Opening the store for B raises the epoch, and the store refuses any append that carries an older one. If A were still running because of a bug or a partition, its writes would fail rather than fork the log. The same fencing covers a failed move: if B dies while thawed, the orchestrator thaws the agent on another host, which raises the epoch again, and A's forwarding target changes with the directory.
+1. **Nothing is lost.** Every message is durable in a mailbox before it is acknowledged, and leaves a mailbox only after it is durable in the next place: the agent's log, or the next host's mailbox.
+2. **Nothing is admitted twice.** The seen set travels in the quiesce snapshot, so B recognizes messages A had already taken in, and any message delivered to both hosts or forwarded twice has one checksum.
+3. **Only one host writes.** Opening the store for B raises the epoch, and the store refuses any append that carries an older one. If A were still running because of a bug or a partition, its writes would fail rather than fork the log. The same fencing covers a failed move: if B dies while thawed, the orchestrator thaws the agent on another host, which raises the epoch again, and A's forwarder is pointed at the new host.
 
-Waiting for A's spool to drain once before releasing B means everything that arrived during the quiesce window is sorted before B runs anything. Messages that reach A after that are still delivered, as late arrivals, until A is torn down.
+Waiting for A's mailbox to empty once before releasing B means everything that arrived during the quiesce window is sorted before B runs anything. Messages that reach A after that are still delivered, as late arrivals, until A is torn down.
 
 ## Isolation in a multi-tenant process
 
@@ -828,7 +866,7 @@ code.inline = { command = ["globex-crm-mcp"], tools = ["lookup_customer", "open_
 after_crash = "wait"
 
 [inbox]
-dedupe_horizon = "24h"
+dedupe_horizon = "10m"
 late_policy = "refuse"
 ```
 
@@ -853,7 +891,7 @@ Decided after review of the first draft:
 
 Still open:
 
-1. **Late arrivals.** The default for `late_policy` (refuse or admit) and the length of `dedupe_horizon`. Refusing is safer against duplicates; admitting is safer against loss when a host was partitioned for longer than the horizon.
+1. **Late arrivals.** The default for `late_policy` (refuse or admit). Refusing is safer against duplicates; admitting is safer against loss when a host was partitioned for longer than the horizon. The horizon itself should follow from the retry and forwarding limits rather than be tuned separately.
 2. **Where timestamps come from.** Sender clocks are simplest, but skew between senders changes the order in which their messages are taken. A cluster gateway that stamps every message gives one clock, at the cost of a component every message must pass through.
 3. **Telling the model about late messages.** A late message is logged with a `late` flag. Whether the request builder should show that to the model, for example as "this message was sent before your last reply", is a prompt-design question.
 
@@ -871,4 +909,4 @@ Still open:
 | Hard caps on steps and forced continuations | Grok Build (forced continuations), opencode (steps) |
 | Session actor that owns its state and takes commands over a channel | Grok Build |
 | Runner and code split, immutable plugin instances, state slots, drain, park and thaw phases | New in this proposal |
-| Sender-stamped envelopes sorted and deduplicated by `(timestamp, checksum)`, host spools, epoch fencing for moves between hosts | New in this proposal |
+| Sender-stamped envelopes sorted and deduplicated by `(timestamp, checksum)`, a per-host mailbox outside the context with one consumer at a time, epoch fencing for moves between hosts | New in this proposal |
