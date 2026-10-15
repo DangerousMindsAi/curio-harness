@@ -257,7 +257,7 @@ The loop lives in `packages/core/agent-loop/src/agent.ts` (`ReactLoopAgent`, abo
   - Persistence-type changes require explicit acknowledgement records (`docs/persistence-changes/`).
 - **Storage.**
   - Sessions are stored as JSONL per session, zstd-compressed with checksummed frames by default, with torn-tail crash recovery (`packages/session/session-persistence-jsonl`). Write locking uses native POSIX flock.
-  - `session-checkpoint-policy` fails closed: work is made durable before each model request and before each top-level tool body, and a tool interrupted by a crash recovers with an "unknown outcome" instead of being retried.
+  - `session-checkpoint-policy` fails closed: work is made durable before each model request and before each top-level tool body, and a tool interrupted by a crash recovers with an "unknown outcome" instead of being retried. Resume is not automatic: the interrupted turn is closed and the session waits for the next message. See [Crash Recovery](../crash-recovery/README.md#deepseek-harness).
   - SQLite (`node:sqlite`) is used only for derived and secondary data: the `session-query-sqlite` FTS5 index (schema version 8) and the `storage-sqlite` backend for non-session domains. JSON-file storage is the default domain backend in base.
 - **Replay and reconstruction.**
   - `deriveMessages()` (`packages/core/session/src/index.ts:984`) projects model history from the log.

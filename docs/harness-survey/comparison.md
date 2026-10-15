@@ -17,7 +17,7 @@ This compares the three architecture reports in this folder: [opencode](opencode
 | Process model | One shared background server per user; every UI is an HTTP/SSE client | One `dsh` launcher; each surface is a profile (stack of YAML patches) | One binary; the TUI talks ACP to an in-process agent; optional per-machine "leader" |
 | Interactive UI | TUI (OpenTUI + Solid), web, Electron | Web (React) and Electron; no TUI | TUI (ratatui), `--minimal` scrollback mode |
 | Editor/automation | ACP, generated HTTP SDK, in-process SDK, GitHub Action | ACP, JSON-RPC SDK (TypeScript and Python) | ACP over stdio or WebSocket, headless `-p` |
-| Session store | SQLite event table plus projections | JSONL event log (zstd), versioned format with migrations | Per-session files (`updates.jsonl`, `chat_history.jsonl`, …) via a persistence actor |
+| Session store | SQLite projections (raw event table optional) | JSONL event log (zstd), versioned format with migrations | Per-session files (`updates.jsonl`, `chat_history.jsonl`, …) via a persistence actor |
 | Loop shape | One LLM call per step, history reloaded from SQLite | ReAct loop with typed waterfall hooks at every stage | Nested round/sample loop with reminders, gates and stop hooks |
 | Step limit | Per-agent `steps` | None in the loop; plugins advise | `max_turns` plus stationarity hard stop |
 | Edit tool | Exact replace with tiered fuzzy matching; Codex `patch` for GPT models | Exact string replace with read-before-write policy | Several dialects, including content-hash **hashline** anchors |
@@ -61,7 +61,7 @@ The approaches here are almost orthogonal. DeepSeek Harness is sandbox-first: co
 
 ### Persistence
 
-All three are event-sourced in spirit, with different levels of rigor. opencode writes durable events to SQLite and projects them into read models, records each tool call before its side effects, and resumes crashed runs at startup. DeepSeek is the strictest: every model-visible input must be reconstructable from the log, each request is derived from the log just before sending and then frozen, compaction is a "replace" view that keeps the originals, and the file format is versioned with one-step migrations that never overwrite earlier generations. Grok Build stores several parallel files per session behind a persistence actor with a written power-loss contract, and adds three-domain rewind (files, hunk attribution, git).
+All three are event-sourced in spirit, with different levels of rigor. opencode writes durable events to SQLite and projects them into read models, records each tool call before its side effects, and resumes crashed runs at startup without user input. DeepSeek is the strictest: every model-visible input must be reconstructable from the log, each request is derived from the log just before sending and then frozen, compaction is a "replace" view that keeps the originals, and the file format is versioned with one-step migrations that never overwrite earlier generations. Grok Build stores several parallel files per session behind a persistence actor with a written power-loss contract, and adds three-domain rewind (files, hunk attribution, git).
 
 ## What is unique about each
 
