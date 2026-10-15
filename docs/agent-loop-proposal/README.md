@@ -659,6 +659,7 @@ pub trait QueueConsumer: Send {
 
 pub struct QueuedMessage {
     pub id: QueueMsgId,          // assigned by the queue, increasing within one agent's queue
+    pub sent_at: Timestamp,      // when the sender sent it; recorded in the log, not used for ordering
     pub delivery: Delivery,      // NextTurn | NextStep
     pub body: MessageBody,
 }
@@ -898,12 +899,12 @@ Decided after review of the first draft:
 5. **A drain does not deny pending approvals.** A parked agent stays parked through a quiesce or a move, and the request is still waiting when it resumes.
 6. **Storage backends are configurable** through the `SessionStore` plugin, per agent.
 7. **Inbound messages wait in a shared queue, provided by a plugin.** An agent pulls only when it can use a message, so nothing arrives while it is quiesced, and moving it between hosts is a quiesce and a resume.
-8. **New agents come from a provisioner plugin** named in the process's startup file. After creation, an agent is rebuilt from its own log.
+8. **Messages are used in queue order.** The agent never sorts or reorders them. Each message carries the time it was sent, which is logged for diagnosis but not used for ordering.
+9. **New agents come from a provisioner plugin** named in the process's startup file. After creation, an agent is rebuilt from its own log.
 
 Still open:
 
-1. **Message order across senders.** The queue delivers in the order it received messages. If ordering by when a message was sent matters more than when it arrived, the queue plugin would need to reorder, which most brokers do not do.
-2. **Provisioner availability.** Resuming an agent needs `locate`. A deterministic locator (the log's location derived from the agent id) removes that dependency; a directory lookup is more flexible but makes the provisioner part of every resume.
+1. **Provisioner availability.** Resuming an agent needs `locate`. A deterministic locator (the log's location derived from the agent id) removes that dependency; a directory lookup is more flexible but makes the provisioner part of every resume.
 
 ## What this borrows
 
