@@ -209,6 +209,14 @@ pub trait Plugin: Send + Sync + 'static {
         decode_state::<()>(blob)
     }
 
+    /// Checks this plugin's references to other plugins of the same agent, such as a
+    /// driver's model provider. Called for every plugin once the whole table is built,
+    /// when an agent is created, thawed or recovered, so a dangling reference fails the
+    /// load instead of the first turn. The default checks nothing.
+    fn check(&self, _plugins: &PluginTable) -> Result<()> {
+        Ok(())
+    }
+
     /// The plugin as the agent's loop, if it is one. An agent needs exactly one.
     fn as_driver(&self) -> Option<&dyn Driver> {
         None
@@ -551,7 +559,7 @@ impl PluginTable {
     }
 
     /// The model provider with this plugin id. Fails with a configuration error if there's
-    /// no such plugin or it provides no model; the driver checks its default route at start.
+    /// no such plugin or it provides no model; the default driver checks its route at load.
     pub fn model(&self, id: &PluginId) -> Result<Arc<dyn Plugin>> {
         let entry = self.index_of(id).map(|i| &self.entries[i]);
         match entry {

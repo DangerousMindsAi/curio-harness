@@ -718,3 +718,35 @@ plugins:
         .unwrap();
     assert!(err.to_string().contains("secret `key`"), "{err}");
 }
+
+/// A driver whose `model` names a plugin that is not a model provider fails at creation,
+/// before the agent's log exists, instead of when its first turn starts.
+#[tokio::test]
+async fn a_driver_without_a_model_provider_fails_at_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+id: a
+tenant: t1
+resume: { after_crash: wait }
+plugins:
+  - id: driver
+    runner: builtin.driver.react
+    code: { model: queue, max_steps_per_turn: 4, max_forced_continuations: 1 }
+  - id: queue
+    runner: builtin.queue.file
+    code: { dir: queues }
+"#;
+    write_agent(dir.path(), "a", yaml);
+    let rt = runtime_with_secrets(dir.path(), json!({})).await;
+    let err = rt
+        .create(CreateRequest {
+            template: "a".into(),
+            agent_id: None,
+            params: Value::Null,
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("not a model provider"), "{err}");
+    assert!(!rt.log_store().exists(&AgentId::new("a")).await.unwrap());
+}

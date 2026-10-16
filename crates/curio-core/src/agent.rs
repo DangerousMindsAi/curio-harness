@@ -127,7 +127,7 @@ pub enum Command {
         reply: oneshot::Sender<DrainResult>,
     },
     /// Answer a question a plugin asked. Stored in [`AgentCtx::answers`] until the asker
-    /// takes it.
+    /// takes it or the turn ends.
     Answer {
         /// The question being answered.
         request: RequestId,
@@ -141,8 +141,6 @@ pub enum Command {
 pub enum Exit {
     /// The agent quiesced and its image went to the drain waiters.
     Quiesced,
-    /// The agent stopped for good. No code path produces it yet.
-    Closed,
 }
 
 /// What the agent is doing. Set by the driver and by [`AgentCtx::settle_drain`]; for
@@ -155,8 +153,6 @@ pub enum Phase {
     Running,
     /// Quiesced; the task is about to exit.
     Quiesced,
-    /// Stopped for good. Not set anywhere yet.
-    Closed,
 }
 
 /// Live output for whoever watches the agent. Not logged: everything that matters for
@@ -300,7 +296,8 @@ pub struct AgentCtx {
     pub loaded_by: LoadKind,
     /// Cancelled to cancel the current turn. Replaced at the start of each turn.
     pub turn_cancel: CancellationToken,
-    /// Answers received for questions plugins asked.
+    /// Answers received for questions plugins asked during the current turn. Cleared when
+    /// a new turn starts, so answers to questions nobody is waiting for don't accumulate.
     pub answers: HashMap<RequestId, Answer>,
     /// Where live output goes.
     pub observer: Observer,
@@ -308,8 +305,8 @@ pub struct AgentCtx {
     pub(crate) replaying: bool,
     /// The pending drain, if one was requested and not settled yet.
     drain: Option<DrainState>,
-    /// Set when a drain command arrived and `drain_requested` hasn't been dispatched for it.
-    drain_hook_pending: Option<DrainPoint>,
+    /// Set when a drain command arrived and `drain_requested` hasn't been dispatched since.
+    drain_hook_pending: bool,
     /// Receives commands from the agent's handles.
     commands: mpsc::Receiver<Command>,
     /// Set once every handle is dropped, so waits stop polling the closed channel.
@@ -345,17 +342,19 @@ impl AgentCtx {
             observer: Observer::new(),
             replaying: false,
             drain: None,
-            drain_hook_pending: None,
+            drain_hook_pending: false,
             commands,
             commands_closed: false,
         };
         (cx, tx)
     }
 
-    /// Starts a fresh cancellation scope for a new turn. Call it before logging
-    /// `TurnStarted`, so a cancel aimed at the previous turn doesn't leak into this one.
+    /// Starts a fresh cancellation scope for a new turn and drops answers left over from
+    /// the previous one. Call it before logging `TurnStarted`, so a cancel aimed at the
+    /// previous turn doesn't leak into this one.
     pub fn begin_turn_scope(&mut self) {
         self.turn_cancel = CancellationToken::new();
+        self.answers.clear();
     }
 
     /// The point a pending drain asked for, if one is pending.
@@ -410,7 +409,7 @@ impl AgentCtx {
                 if at == DrainPoint::Immediate {
                     self.turn_cancel.cancel();
                 }
-                self.drain_hook_pending = Some(at);
+                self.drain_hook_pending = true;
             }
         }
     }
@@ -481,12 +480,15 @@ impl AgentCtx {
         }
     }
 
-    /// Handles waiting commands and dispatches `drain_requested` for a new drain. The driver
-    /// calls it at each safe point, before [`AgentCtx::settle_drain`]. Fails if a
-    /// `drain_requested` listener fails.
+    /// Handles waiting commands and dispatches `drain_requested` once for any drain
+    /// commands that arrived since the last call, with the drain point now in effect (the
+    /// strictest one asked for). The driver calls it at each safe point, before
+    /// [`AgentCtx::settle_drain`]. Fails if a `drain_requested` listener fails.
     pub async fn apply_pending_commands(&mut self) -> Result<()> {
         self.poll_commands();
-        if let Some(at) = self.drain_hook_pending.take() {
+        if std::mem::take(&mut self.drain_hook_pending)
+            && let Some(at) = self.draining()
+        {
             dispatch(self, &mut HookEvent::DrainRequested { at }).await?;
         }
         Ok(())
@@ -559,10 +561,8 @@ impl AgentCtx {
     /// driver must return without touching the log again. At a step boundary the open turn
     /// is recorded as suspended, so thaw continues it.
     ///
-    /// If the `snapshot` hook fails, the drain is still pending and the runtime answers its
-    /// waiters through [`AgentCtx::fail_drain_waiters`]. If a later step fails (logging,
-    /// syncing, imaging, releasing or detaching), the drain has already been taken, so its
-    /// waiters' channels are dropped and they see [`Error::AgentGone`] instead.
+    /// If any step fails, every waiter receives [`DrainResult::Failed`] with the error, and
+    /// the error is returned so the driver stops; the agent can then be recovered from its log.
     pub async fn settle_drain(&mut self, here: DrainPoint) -> Result<Option<Exit>> {
         match &self.drain {
             Some(d) if here.satisfies(d.at) => {}
@@ -574,6 +574,31 @@ impl AgentCtx {
         let Some(drain) = self.drain.take() else {
             return Ok(None);
         };
+        let forced = drain.forced;
+        match self.quiesce(here, forced).await {
+            Ok(image) => {
+                self.observer.emit(Observation::Quiesced { forced });
+                for waiter in drain.waiters {
+                    let _ = waiter.send(DrainResult::Quiesced {
+                        image: Box::new(image.clone()),
+                        forced,
+                    });
+                }
+                Ok(Some(Exit::Quiesced))
+            }
+            Err(e) => {
+                for waiter in drain.waiters {
+                    let _ = waiter.send(DrainResult::Failed(e.to_string()));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The fallible part of [`AgentCtx::settle_drain`]: logs `Quiesced`, syncs, builds the
+    /// image, releases the log and detaches from the queue. At a step boundary the open
+    /// turn is recorded as suspended.
+    async fn quiesce(&mut self, here: DrainPoint, forced: bool) -> Result<AgentImage> {
         let suspended_turn = if here == DrainPoint::Step {
             self.journal.view().open_turn
         } else {
@@ -582,7 +607,7 @@ impl AgentCtx {
         self.journal.append(Event::Quiesced {
             at: here,
             suspended_turn,
-            forced: drain.forced,
+            forced,
         })?;
         self.journal.sync().await?;
         let image = self.to_image()?;
@@ -591,16 +616,7 @@ impl AgentCtx {
             queue.detach().await?;
         }
         self.phase = Phase::Quiesced;
-        self.observer.emit(Observation::Quiesced {
-            forced: drain.forced,
-        });
-        for waiter in drain.waiters {
-            let _ = waiter.send(DrainResult::Quiesced {
-                image: Box::new(image.clone()),
-                forced: drain.forced,
-            });
-        }
-        Ok(Some(Exit::Quiesced))
+        Ok(image)
     }
 
     /// Tells every drain waiter the agent stopped without an image. Called by the runtime

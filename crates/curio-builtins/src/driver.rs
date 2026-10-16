@@ -68,8 +68,8 @@ use async_trait::async_trait;
 use curio_core::{
     AgentCtx, Answer, AssistantMessage, Concurrency, DrainPoint, Driver, ErrorDecision, Event,
     Exit, Finish, Flow, HookEvent, LoadEnv, LoadedPlugin, ModelErrorKind, ModelRequest,
-    Observation, Phase, Plugin, PluginId, RequestId, ResponseVerdict, Result, Route, Runner,
-    StepOutcome, ToolCall, ToolDecision, ToolResult, TurnEnd, TurnId, dispatch,
+    Observation, Phase, Plugin, PluginId, PluginTable, RequestId, ResponseVerdict, Result, Route,
+    Runner, StepOutcome, ToolCall, ToolDecision, ToolResult, TurnEnd, TurnId, dispatch,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -85,8 +85,8 @@ pub struct ReactDriverRunner;
 #[serde(deny_unknown_fields)]
 pub struct DriverCode {
     /// Plugin id of the default model provider. Required. It goes into each attempt's
-    /// [`Route`], where a `request` listener may point it at another provider. Checked when
-    /// [`Driver::run`] starts, since the plugin table doesn't exist yet at load.
+    /// [`Route`], where a `request` listener may point it at another provider. Checked by
+    /// [`Plugin::check`] once every plugin of the agent is loaded.
     pub model: PluginId,
     /// Hard cap on steps in one turn, counted across a suspend and thaw. Required; when a
     /// step would exceed it, the turn ends with [`TurnEnd::StepLimit`].
@@ -160,6 +160,11 @@ pub struct ReactDriver {
 }
 
 impl Plugin for ReactDriver {
+    /// Fails unless `model` names a model provider of this agent.
+    fn check(&self, plugins: &PluginTable) -> Result<()> {
+        plugins.model(&self.code.model).map(|_| ())
+    }
+
     fn as_driver(&self) -> Option<&dyn Driver> {
         Some(self)
     }
@@ -188,19 +193,18 @@ enum Prepared {
 impl Driver for ReactDriver {
     /// Runs the agent until it quiesces, or fails.
     ///
-    /// First checks that `model` names a model provider, dispatches `agent_loaded` and
-    /// syncs whatever its listeners logged. If the view has an open turn, which can
+    /// First dispatches `agent_loaded` and syncs whatever its listeners logged.
+    /// (`model` was already checked at load, by [`Plugin::check`].) If the view has an open turn, which can
     /// only be one a drain suspended (recovery closes any other), the driver continues it
     /// before anything else. Then it loops: handle commands, quiesce if a drain is satisfied by a
     /// turn boundary, otherwise wait for next-turn input and run a turn.
     ///
     /// Returns [`Exit::Quiesced`] after a drain, either between turns or at a step
-    /// boundary. Never returns [`Exit::Closed`]. Any error from a hook listener, the log
+    /// boundary. Any error from a hook listener, the log
     /// (including [`curio_core::Error::Fenced`]) or the queue stops the agent with that
     /// error; the runtime then fails any drain waiters, and the agent can be recovered from
     /// its log.
     async fn run(&self, cx: &mut AgentCtx) -> Result<Exit> {
-        cx.plugins.model(&self.code.model)?;
         dispatch(cx, &mut HookEvent::AgentLoaded { how: cx.loaded_by }).await?;
         cx.journal.sync().await?;
 
@@ -389,8 +393,8 @@ impl ReactDriver {
                     });
                 }
                 ErrorDecision::Retry { after } => {
-                    // A cancel during this wait ends it early; the next attempt then sees
-                    // the cancelled token and returns at once.
+                    // A cancel during this wait ends it early, and the step ends before
+                    // another `request` dispatch or model call.
                     cx.observer.emit(Observation::Retrying {
                         error: error.to_string(),
                     });
@@ -402,6 +406,9 @@ impl ReactDriver {
                         }
                     })
                     .await;
+                    if cx.turn_cancel.is_cancelled() {
+                        return Ok(StepOutcome::Cancelled);
+                    }
                 }
             }
         };
@@ -460,6 +467,7 @@ impl ReactDriver {
                 continue;
             }
             let mut decision = ToolDecision::Allow;
+            let original = call.clone();
             dispatch(
                 cx,
                 &mut HookEvent::ToolPre {
@@ -468,6 +476,19 @@ impl ReactDriver {
                 },
             )
             .await?;
+            if call.id != original.id {
+                return Err(curio_core::Error::Config(format!(
+                    "a tool_pre listener changed the id of call `{}`",
+                    original.id
+                )));
+            }
+            if call != original {
+                cx.journal.append(Event::ToolCallRewritten {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })?;
+            }
             if let ToolDecision::Ask { question } = decision {
                 decision = self.ask(cx, &call, question).await?;
             }

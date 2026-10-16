@@ -188,24 +188,38 @@ impl Tool for Shell {
     /// Runs the command to completion and reports it. A non-zero exit, or death by a
     /// signal (shown as exit code `none (killed)`), makes the result an error.
     ///
-    /// When `cx.cancel` fires, or the driver's tool timeout drops this future, the `sh`
-    /// process is killed (`kill_on_drop`) and the result says the outcome is unknown.
-    /// Only `sh` itself is killed: anything it started in the background can keep running.
+    /// `sh` runs as the leader of its own process group. When `cx.cancel` fires, or the
+    /// driver's tool timeout drops this future, the whole group is killed with `SIGKILL`,
+    /// so pipelines and children go with it, and a cancel's result says the outcome is
+    /// unknown. A process that left the group (for example with `setsid`) is not reached.
+    /// Once `sh` has exited and its output is closed, nothing is killed.
     async fn call(&self, cx: ToolCx, args: Value) -> ToolOutput {
         let Some(command) = args.get("command").and_then(Value::as_str) else {
             return ToolOutput::error("`command` must be a string.");
         };
-        let child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output();
+        let mut command = {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c")
+                .arg(command)
+                .current_dir(&self.root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            c
+        };
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => return ToolOutput::error(format!("Could not start the command: {e}")),
+        };
+        let mut group = GroupKill(child.id());
         let output = tokio::select! {
-            o = child => o,
+            o = child.wait_with_output() => o,
             _ = cx.cancel.cancelled() => return ToolOutput::error("Cancelled while running; the outcome is unknown."),
         };
+        group.0 = None;
         match output {
             Err(e) => ToolOutput::error(format!("Could not start the command: {e}")),
             Ok(o) => {
@@ -223,6 +237,23 @@ impl Tool for Shell {
                     content: truncate(text, self.max_output),
                     is_error: !o.status.success(),
                 }
+            }
+        }
+    }
+}
+
+/// Kills the process group led by the given pid when dropped, unless the pid was taken
+/// out first. Guards a running `sh` in [`Shell::call`].
+struct GroupKill(Option<u32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(|p| libc::pid_t::try_from(p).ok()) {
+            // SAFETY: kill has no memory effects; a negative pid addresses the group that
+            // `process_group(0)` made with the shell as its leader.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
             }
         }
     }
@@ -425,5 +456,57 @@ mod tests {
         );
         assert!(refuse_symlinks(&root, Path::new("file")).await.is_err());
         assert!(refuse_symlinks(&root, Path::new("new/y.txt")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_shell_kills_its_whole_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = Shell {
+            spec: ToolSpec {
+                name: "shell".into(),
+                description: String::new(),
+                parameters: json!({}),
+                concurrency: Concurrency::Exclusive,
+            },
+            root: root.path().to_path_buf(),
+            max_output: 1000,
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cx = ToolCx {
+            agent: curio_core::AgentId::new("a"),
+            tenant: curio_core::TenantId::new("t"),
+            call_id: curio_core::CallId::new("c"),
+            grants: Default::default(),
+            cancel: cancel.clone(),
+        };
+        let call = tokio::spawn(async move {
+            shell
+                .call(cx, json!({ "command": "sleep 30 & echo $! > pid; wait" }))
+                .await
+        });
+        let pid_file = root.path().join("pid");
+        while std::fs::read_to_string(&pid_file).map_or(true, |t| !t.ends_with('\n')) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        cancel.cancel();
+        assert!(call.await.unwrap().is_error);
+        // The background `sleep` was in the group; give the kernel a moment to reap it.
+        let mut alive = true;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only checks that the process exists.
+            alive = unsafe { libc::kill(pid, 0) } == 0
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|s| s.contains(") Z "));
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!alive, "the background sleep survived the cancel");
     }
 }

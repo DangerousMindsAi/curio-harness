@@ -227,7 +227,8 @@ impl Runtime {
 
     /// Loads every plugin in `config` through its runner, in config order, and indexes them.
     /// Returns the table and each plugin's initial state slot, in the same order. Load
-    /// errors are attributed to the failing plugin.
+    /// errors, and failures of [`Plugin::check`] once all are loaded, are attributed to the
+    /// failing plugin.
     async fn load_plugins(
         &self,
         config: &AgentConfig,
@@ -261,7 +262,14 @@ impl Runtime {
             });
             states.push(loaded.initial_state);
         }
-        Ok((PluginTable::build(entries)?, states))
+        let table = PluginTable::build(entries)?;
+        for entry in table.entries() {
+            entry
+                .plugin
+                .check(&table)
+                .map_err(|e| Error::plugin(&entry.id, e))?;
+        }
+        Ok((table, states))
     }
 
     /// Creates a new agent from the provisioner's output and starts it.
@@ -314,10 +322,11 @@ impl Runtime {
     /// Restores a quiesced agent from its image and starts it. Fails with
     /// [`Error::StaleImage`] if the agent's log has moved past the image.
     ///
-    /// The log is opened, and its epoch raised, before plugins load. If loading then fails,
-    /// the previous owner is still fenced off, and the same image can be thawed again once
-    /// the problem is fixed, since nothing was appended. The view comes from the image, so
-    /// a step-boundary drain's open turn is still open and the driver continues it.
+    /// Plugins are loaded and every slot restored before the log is opened, so a plugin
+    /// that no longer loads fails the thaw without touching the log, and the same image can
+    /// be thawed once the problem is fixed. Each plugin must have exactly one slot in the
+    /// image. The view comes from the image, so a step-boundary drain's open turn is still
+    /// open and the driver continues it.
     pub async fn thaw(&self, image: AgentImage) -> Result<RunningAgent> {
         if image.format != IMAGE_FORMAT {
             return Err(Error::config(format!(
@@ -326,16 +335,8 @@ impl Runtime {
             )));
         }
         let config = image.config;
-        let opened = self
-            .log_store()
-            .open(&config.id, OpenMode::ContinueFrom(image.log_position))
-            .await?;
         let (table, mut states) = self.load_plugins(&config).await?;
-        if image.slots.len() != table.entries().len() {
-            return Err(Error::config(
-                "the image does not have exactly one state slot per plugin",
-            ));
-        }
+        let mut restored = vec![false; table.entries().len()];
         for slot in image.slots {
             let index = table.index_of(&slot.plugin).ok_or_else(|| {
                 Error::config(format!(
@@ -343,6 +344,12 @@ impl Runtime {
                     slot.plugin
                 ))
             })?;
+            if std::mem::replace(&mut restored[index], true) {
+                return Err(Error::config(format!(
+                    "the image has two slots for plugin `{}`",
+                    slot.plugin
+                )));
+            }
             let entry = &table.entries()[index];
             let blob = if slot.version == entry.state_version {
                 slot.blob
@@ -360,6 +367,16 @@ impl Runtime {
             };
             states[index] = entry.plugin.decode_state(blob)?;
         }
+        if let Some(missing) = restored.iter().position(|done| !done) {
+            return Err(Error::config(format!(
+                "the image has no slot for plugin `{}`",
+                table.entries()[missing].id
+            )));
+        }
+        let opened = self
+            .log_store()
+            .open(&config.id, OpenMode::ContinueFrom(image.log_position))
+            .await?;
         let journal = Journal::new(opened.log, image.view);
         let (mut cx, tx) = AgentCtx::new(
             config,
@@ -401,7 +418,10 @@ impl Runtime {
         cx.replaying = true;
         for event in &opened.events {
             cx.journal.replay(event);
-            dispatch(&mut cx, &mut HookEvent::Replay { event }).await?;
+            if let Err(e) = dispatch(&mut cx, &mut HookEvent::Replay { event }).await {
+                let _ = cx.journal.release().await;
+                return Err(e);
+            }
         }
         cx.replaying = false;
         let repaired_calls = repair_after_crash(&mut cx)?;
@@ -427,7 +447,14 @@ impl Runtime {
         let queue = queue
             .as_queue()
             .ok_or_else(|| Error::config("queue plugin has no queue service"))?;
-        cx.queue = Some(queue.attach(&cx.id).await?);
+        match queue.attach(&cx.id).await {
+            Ok(consumer) => cx.queue = Some(consumer),
+            Err(e) => {
+                // Give the log back so another attempt or host can take it at once.
+                let _ = cx.journal.release().await;
+                return Err(e);
+            }
+        }
         let handle = AgentHandle::new(&cx, tx);
         let task = tokio::spawn(async move {
             let driver = cx.plugins.driver().clone();

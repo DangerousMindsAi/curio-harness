@@ -120,7 +120,7 @@ pub enum StepOutcome {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnEnd {
     /// The model answered (or a plugin concluded the turn) and nothing asked for another
-    /// step. The only end that resets [`Counters::crash_resumes`].
+    /// step.
     Completed,
     /// The turn reached the driver's per-turn step limit.
     StepLimit,
@@ -204,6 +204,18 @@ pub enum Event {
         /// The reply as the provider returned it (with tool calls dropped when it was cut
         /// off by the token limit).
         reply: AssistantMessage,
+    },
+    /// A `tool_pre` listener rewrote a call's name or arguments. Logged when the listeners
+    /// are done, before the call is denied, asked about or run, so the log records what
+    /// actually ran. The history keeps the call as the model made it; only the pending call
+    /// changes.
+    ToolCallRewritten {
+        /// The call, whose id listeners may not change.
+        call_id: CallId,
+        /// The tool name after the rewrite.
+        name: String,
+        /// The arguments after the rewrite, as JSON text.
+        arguments: String,
     },
     /// A `tool_pre` listener denied the call; the reason is the call's model-visible result.
     /// The `ToolResult` that carries the reason follows later, when results are committed.
@@ -370,7 +382,7 @@ pub struct Counters {
     pub forced_this_turn: u32,
     /// Failed model attempts in the current step; reset by `StepStarted`.
     pub failed_attempts_this_step: u32,
-    /// Turns interrupted by a crash in a row; reset when a turn completes.
+    /// Turns interrupted by a crash in a row; reset when a turn ends any other way.
     pub crash_resumes: u32,
     /// Prompt tokens over the agent's life, as providers reported them.
     pub prompt_tokens: u64,
@@ -382,7 +394,7 @@ pub struct Counters {
 /// repair writes a result for each one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingCall {
-    /// The call as the model made it.
+    /// The call as the model made it, or as a `tool_pre` listener rewrote it.
     pub call: ToolCall,
     /// Whether its `ToolStarted` was logged, meaning the body may have run.
     pub started: bool,
@@ -498,6 +510,20 @@ impl View {
                     tool_call_id: None,
                 });
             }
+            Event::ToolCallRewritten {
+                call_id,
+                name,
+                arguments,
+            } => {
+                if let Some(p) = self
+                    .pending_calls
+                    .iter_mut()
+                    .find(|p| &p.call.id == call_id)
+                {
+                    p.call.name = name.clone();
+                    p.call.arguments = arguments.clone();
+                }
+            }
             Event::ToolStarted { call_id } => {
                 if let Some(p) = self
                     .pending_calls
@@ -526,8 +552,7 @@ impl View {
                 self.open_step = false;
                 match end {
                     TurnEnd::Interrupted => self.counters.crash_resumes += 1,
-                    TurnEnd::Completed => self.counters.crash_resumes = 0,
-                    _ => {}
+                    _ => self.counters.crash_resumes = 0,
                 }
             }
             Event::Quiesced { suspended_turn, .. } => self.suspended = suspended_turn.is_some(),
@@ -597,6 +622,13 @@ mod tests {
                 usage: None,
             },
         });
+        v.fold(&Event::ToolCallRewritten {
+            call_id: call.id.clone(),
+            name: "clock".into(),
+            arguments: r#"{"tz":"UTC"}"#.into(),
+        });
+        assert_eq!(v.pending_calls[0].call.arguments, r#"{"tz":"UTC"}"#);
+        assert_eq!(v.history.messages[0].tool_calls[0].arguments, "{}");
         v.fold(&Event::ToolStarted {
             call_id: call.id.clone(),
         });

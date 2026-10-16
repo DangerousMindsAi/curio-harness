@@ -169,7 +169,8 @@ pub enum HookEvent<'a> {
     },
     /// Per tool call, in model order, before anything runs.
     ToolPre {
-        /// The call, which a listener may rewrite (for example, its arguments).
+        /// The call, which a listener may rewrite (its name or arguments, never its id).
+        /// The driver logs a rewrite as [`crate::Event::ToolCallRewritten`].
         call: &'a mut ToolCall,
         /// What to do with it; starts at [`ToolDecision::Allow`].
         decision: &'a mut ToolDecision,
@@ -201,7 +202,7 @@ pub enum HookEvent<'a> {
     /// the driver applies pending commands after a drain command arrives; several drain
     /// commands that arrive in between give one dispatch.
     DrainRequested {
-        /// The drain point the newest drain command asked for.
+        /// The drain point now in effect: the strictest one any pending drain command asked for.
         at: DrainPoint,
     },
 }

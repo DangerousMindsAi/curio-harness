@@ -94,11 +94,15 @@ pub struct ModelCode {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     /// Extra fields merged into every request body, such as `top_p`. Defaults to empty.
-    /// They're applied last, so they can also override the fields this plugin sets,
-    /// including `model` and `stream`; overriding `stream` breaks the reply parsing.
+    /// They're applied last, so they override `max_tokens` and `temperature` from the
+    /// request. `model`, `messages`, `stream`, `stream_options` and `tools` are refused at
+    /// load, since the reply parsing and the model-visible log depend on them.
     #[serde(default)]
     pub extra_body: Map<String, Value>,
 }
+
+/// Request body fields that [`ModelCode::extra_body`] may not set.
+const RESERVED_BODY_FIELDS: [&str; 5] = ["model", "messages", "stream", "stream_options", "tools"];
 
 /// Default for [`ModelCode::connect_timeout_secs`].
 fn default_connect_timeout() -> u64 {
@@ -120,6 +124,15 @@ impl Runner for OpenAiCompatRunner {
     /// attributed to this plugin, so agent creation stops there.
     async fn load(&self, code: &Value, env: &LoadEnv) -> Result<LoadedPlugin> {
         let code: ModelCode = env.parse_code(code)?;
+        if let Some(field) = RESERVED_BODY_FIELDS
+            .iter()
+            .find(|f| code.extra_body.contains_key(**f))
+        {
+            return Err(Error::plugin(
+                &env.plugin,
+                format!("extra_body may not set `{field}`; the plugin sets it"),
+            ));
+        }
         let url = reqwest::Url::parse(&code.base_url)
             .map_err(|e| Error::plugin(&env.plugin, format!("invalid base_url: {e}")))?;
         let host = url
@@ -408,9 +421,10 @@ impl ModelProvider for OpenAiCompatModel {
     /// Runs one attempt: resolve the key, send, check the status, then read the event
     /// stream line by line until `[DONE]` or the connection closes.
     ///
-    /// Cancellation is checked while waiting for the response headers and for each chunk,
-    /// and returns a `Cancelled` error at once (dropping the connection). Reading the body
-    /// of an error response isn't covered by the cancel token or either timeout.
+    /// Cancellation is checked while waiting for the response headers, for the body of an
+    /// error response and for each chunk, and returns a `Cancelled` error at once (dropping
+    /// the connection). An error body gets the idle timeout; if it doesn't arrive in time,
+    /// the error is reported with the status alone.
     async fn complete(
         &self,
         request: ModelRequest,
@@ -457,8 +471,14 @@ impl ModelProvider for OpenAiCompatModel {
             Ok(Ok(r)) => r,
         };
         let status = response.status().as_u16();
+        let idle = Duration::from_secs(self.code.idle_timeout_secs);
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = tokio::select! {
+                body = tokio::time::timeout(idle, response.text()) => {
+                    body.ok().and_then(|b| b.ok()).unwrap_or_default()
+                }
+                _ = cancel.cancelled() => return Err(cancelled()),
+            };
             let mut text: String = body.chars().take(2000).collect();
             if text.is_empty() {
                 text = format!("HTTP {status}");
@@ -473,7 +493,6 @@ impl ModelProvider for OpenAiCompatModel {
         let mut stream = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
         let mut reply = ReplyAssembler::default();
-        let idle = Duration::from_secs(self.code.idle_timeout_secs);
         loop {
             let next = tokio::select! {
                 n = tokio::time::timeout(idle, stream.next()) => n,

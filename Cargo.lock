@@ -271,6 +271,7 @@ dependencies = [
  "curio-core",
  "futures",
  "humantime",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
