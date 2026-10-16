@@ -1,5 +1,39 @@
 //! `builtin.model.openai-compat`: a model provider for any OpenAI-compatible chat
-//! completions API, such as DeepInfra's. Streams the reply and assembles tool calls.
+//! completions API, such as DeepInfra's.
+//!
+//! It's a per-agent plugin that implements [`ModelProvider`] and subscribes to no hooks.
+//! The driver calls [`ModelProvider::complete`] once per attempt with a request built from
+//! the agent's history; this plugin turns it into one streaming `POST <base_url>/chat/completions`,
+//! forwards text and reasoning deltas to the agent's observer as they arrive, and returns
+//! the assembled [`AssistantMessage`]. Nothing it streams is logged: the driver logs the
+//! complete reply, and a reply cut off mid-stream is simply a failed attempt.
+//!
+//! ```yaml
+//! - id: model
+//!   runner: builtin.model.openai-compat
+//!   code:
+//!     base_url: https://api.deepinfra.com/v1/openai
+//!     model: deepseek-ai/DeepSeek-V3.2
+//!     api_key_secret: deepinfra         # optional; a name in the host's secret store
+//!     connect_timeout_secs: 60          # optional
+//!     idle_timeout_secs: 120            # optional
+//!     extra_body: { top_p: 0.9 }        # optional
+//!   grants:
+//!     hosts: [api.deepinfra.com]        # must include base_url's host
+//!     secrets: [deepinfra]              # must include api_key_secret
+//! ```
+//!
+//! Grants are checked at load: the base URL's host must be in `grants.hosts`, and the API
+//! key must resolve, so a missing key fails agent creation instead of the first turn. The
+//! key itself is never stored in the plugin. It's resolved again through the plugin's
+//! [`SecretScope`] for every request and sent as a bearer token, which keeps it out of
+//! logs, images and memory between requests.
+//!
+//! Failures come back as [`ModelError`]s with a kind that retry policies read. Rate limits,
+//! timeouts, server errors, network errors and malformed or truncated streams are
+//! `Transient`; a 4xx whose body mentions the context length is `ContextOverflow`; any
+//! other 4xx is `Fatal`; a cancel is `Cancelled`. This plugin never retries by itself;
+//! `builtin.retry` does that through the `request_error` hook.
 
 use async_trait::async_trait;
 use curio_core::{
@@ -15,8 +49,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Loads [`OpenAiCompatModel`]. Holds one HTTP connection pool shared by every agent;
-/// credentials travel with each request.
+/// credentials travel with each request, so sharing the pool leaks nothing between tenants.
 pub struct OpenAiCompatRunner {
+    /// The shared pool. Cloning a `reqwest::Client` shares it.
     client: reqwest::Client,
 }
 
@@ -39,27 +74,37 @@ impl Default for OpenAiCompatRunner {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCode {
-    /// API root, such as `https://api.deepinfra.com/v1/openai`. `/chat/completions` is appended.
+    /// API root, such as `https://api.deepinfra.com/v1/openai`. `/chat/completions` is
+    /// appended, after trimming any trailing slash. Required; must parse as a URL with a
+    /// host, and that host must be in `grants.hosts`.
     pub base_url: String,
-    /// The provider's model id.
+    /// The provider's model id, sent as the body's `model` field. Required.
     pub model: String,
-    /// Name of the secret holding the API key. It must also be in `grants.secrets`.
+    /// Name of the secret holding the API key, looked up in the agent's tenant. It must
+    /// also be in `grants.secrets`. Defaults to none, which sends no `Authorization`
+    /// header (for local servers that don't need one).
     #[serde(default)]
     pub api_key_secret: Option<String>,
-    /// Seconds to wait for the response to start.
+    /// Seconds to wait from sending the request until the response headers arrive.
+    /// Defaults to 60. Expiry is a transient error.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
-    /// Seconds to wait between streamed chunks.
+    /// Seconds to wait for each streamed chunk once the response has started. Defaults to
+    /// 120. Expiry is a transient "the stream stalled" error.
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
-    /// Extra fields merged into every request body, such as `top_p`.
+    /// Extra fields merged into every request body, such as `top_p`. Defaults to empty.
+    /// They're applied last, so they can also override the fields this plugin sets,
+    /// including `model` and `stream`; overriding `stream` breaks the reply parsing.
     #[serde(default)]
     pub extra_body: Map<String, Value>,
 }
 
+/// Default for [`ModelCode::connect_timeout_secs`].
 fn default_connect_timeout() -> u64 {
     60
 }
+/// Default for [`ModelCode::idle_timeout_secs`].
 fn default_idle_timeout() -> u64 {
     120
 }
@@ -70,6 +115,9 @@ impl Runner for OpenAiCompatRunner {
         "builtin.model.openai-compat"
     }
 
+    /// Parses the code, checks the base URL's host against `grants.hosts`, and resolves
+    /// the API key once to prove it exists and is granted. Each check fails with an error
+    /// attributed to this plugin, so agent creation stops there.
     async fn load(&self, code: &Value, env: &LoadEnv) -> Result<LoadedPlugin> {
         let code: ModelCode = env.parse_code(code)?;
         let url = reqwest::Url::parse(&code.base_url)
@@ -93,10 +141,14 @@ impl Runner for OpenAiCompatRunner {
     }
 }
 
-/// One agent's model provider.
+/// One agent's model provider. Immutable; holds no conversation state, since every
+/// request carries the whole history.
 pub struct OpenAiCompatModel {
+    /// The validated code.
     code: ModelCode,
+    /// A handle on the runner's shared connection pool.
     client: reqwest::Client,
+    /// This plugin's view of the secret store: its tenant, its granted names.
     secrets: SecretScope,
 }
 
@@ -106,6 +158,12 @@ impl Plugin for OpenAiCompatModel {
     }
 }
 
+/// Converts one history message to the chat completions wire format.
+///
+/// An assistant message with tool calls carries them as `function` calls, with `content`
+/// set to null when it has no text (some providers reject an empty string there). A tool
+/// message carries the `tool_call_id` it answers. Reasoning text isn't part of
+/// [`ChatMessage`], so it's never sent back to the model.
 fn wire_message(m: &ChatMessage) -> Value {
     let role = match m.role {
         Role::System => "system",
@@ -130,7 +188,11 @@ fn wire_message(m: &ChatMessage) -> Value {
     out
 }
 
-/// The request body for one attempt.
+/// Builds the JSON body for one attempt.
+///
+/// Always asks for a stream with usage in the final chunk. `tools` is present only when
+/// the agent has tools, and `max_tokens` and `temperature` only when the route sets them.
+/// The entries of `extra` are copied in last and win over everything else.
 pub fn request_body(model: &str, request: &ModelRequest, extra: &Map<String, Value>) -> Value {
     let mut body = json!({
         "model": model,
@@ -157,6 +219,11 @@ pub fn request_body(model: &str, request: &ModelRequest, extra: &Map<String, Val
     body
 }
 
+/// Sorts a failed HTTP response into a retry class.
+///
+/// 408, 429 and every 5xx are transient. Otherwise the body is searched, case-insensitively,
+/// for the phrases providers use for an oversized prompt ("context length", "context
+/// window", "too many tokens"), which make it a context overflow. Anything else is fatal.
 fn classify_status(status: u16, body: &str) -> ModelErrorKind {
     let lower = body.to_lowercase();
     if status == 429 || status == 408 || status >= 500 {
@@ -171,26 +238,45 @@ fn classify_status(status: u16, body: &str) -> ModelErrorKind {
     }
 }
 
+/// A tool call while its pieces are still streaming in.
 #[derive(Default)]
 struct PartialCall {
+    /// The provider's call id. Usually sent once, in the call's first chunk; empty until
+    /// then.
     id: String,
+    /// The function name, concatenated from every chunk that carries part of it.
     name: String,
+    /// The JSON argument text, concatenated from every chunk; not parsed here.
     arguments: String,
 }
 
-/// Assembles streamed chunks into one reply.
+/// Assembles the `data:` payloads of one streamed response into an [`AssistantMessage`].
+///
+/// Feed it each payload in order with [`ReplyAssembler::feed`], then call
+/// [`ReplyAssembler::finish`]. It's public so the parsing can be tested without a server.
 #[derive(Default)]
 pub struct ReplyAssembler {
+    /// Answer text so far.
     content: String,
+    /// Reasoning text so far, from `reasoning_content` or `reasoning` deltas.
     reasoning: String,
+    /// Tool calls by their stream `index`.
     calls: Vec<PartialCall>,
+    /// The last finish reason seen; `None` until the provider sends one.
     finish: Option<Finish>,
+    /// Token usage, usually from a final chunk with no choices.
     usage: Option<Usage>,
+    /// Set by the `[DONE]` sentinel; the HTTP loop stops reading once it's set.
     done: bool,
 }
 
 impl ReplyAssembler {
     /// Feeds one SSE `data:` payload. Emits text and reasoning deltas to `observer`.
+    ///
+    /// Only the first choice is read. Tool call fragments are merged by their `index`
+    /// (falling back to "a new call" when a provider leaves it out). Fails with a transient
+    /// error when the payload isn't JSON or is an in-stream `error` object, since both
+    /// usually mean the provider broke off mid-reply.
     pub fn feed(&mut self, data: &str, observer: &Observer) -> std::result::Result<(), ModelError> {
         if data == "[DONE]" {
             self.done = true;
@@ -277,6 +363,12 @@ impl ReplyAssembler {
     }
 
     /// The complete reply. Fails if the stream ended before the provider said it finished.
+    ///
+    /// Calls that never received a name are dropped. A call the provider sent without an
+    /// id gets `call_<index>`; these fallback ids repeat from one reply to the next, which
+    /// is harmless because a step's calls are all resolved before the next request.
+    /// Reasoning is `None` when the stream had none. The missing-finish error is transient,
+    /// worded to say whether `[DONE]` arrived.
     pub fn finish(self) -> std::result::Result<AssistantMessage, ModelError> {
         let Some(finish) = self.finish else {
             let message = if self.done {
@@ -313,6 +405,12 @@ impl ReplyAssembler {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatModel {
+    /// Runs one attempt: resolve the key, send, check the status, then read the event
+    /// stream line by line until `[DONE]` or the connection closes.
+    ///
+    /// Cancellation is checked while waiting for the response headers and for each chunk,
+    /// and returns a `Cancelled` error at once (dropping the connection). Reading the body
+    /// of an error response isn't covered by the cancel token or either timeout.
     async fn complete(
         &self,
         request: ModelRequest,
@@ -394,6 +492,8 @@ impl ModelProvider for OpenAiCompatModel {
                 }
                 Ok(Some(Ok(bytes))) => bytes,
             };
+            // A network chunk can end mid-line, so only complete lines are parsed and the
+            // rest waits in the buffer for the next chunk.
             buffer.extend_from_slice(&chunk);
             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=pos).collect();
@@ -415,6 +515,9 @@ impl ModelProvider for OpenAiCompatModel {
 mod tests {
     use super::*;
 
+    /// Text deltas concatenate, tool call fragments with the same index merge into one call
+    /// (id and name from the first fragment, arguments from all of them), the finish reason
+    /// and the trailing usage chunk are kept, and the first text delta reaches the observer.
     #[test]
     fn assembles_text_and_streamed_tool_calls() {
         let observer = Observer::new();
@@ -451,6 +554,8 @@ mod tests {
         );
     }
 
+    /// A stream that stops before any finish reason fails as a transient error, so a retry
+    /// policy can try again instead of treating the partial text as a reply.
     #[test]
     fn a_stream_without_finish_reason_is_transient() {
         let mut a = ReplyAssembler::default();
@@ -462,6 +567,8 @@ mod tests {
         assert_eq!(a.finish().unwrap_err().kind, ModelErrorKind::Transient);
     }
 
+    /// HTTP failures map to the retry classes: 429 and 5xx are transient, an auth failure is
+    /// fatal, and a 400 that mentions the context length is a context overflow.
     #[test]
     fn status_codes_map_to_retry_classes() {
         assert_eq!(classify_status(429, ""), ModelErrorKind::Transient);

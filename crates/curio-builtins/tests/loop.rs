@@ -1,5 +1,26 @@
 //! End-to-end tests of the loop with the built-in plugins: turns, tools, approval,
 //! quiesce and thaw, drains at a step boundary, crash recovery, fencing and isolation.
+//!
+//! Each test builds a real [`Runtime`] in a fresh temporary directory, with the same
+//! runtime-level plugins a local host uses: the file log store under `logs/`, the YAML
+//! provisioner reading `agents/`, and inline secrets. Agents are created from YAML files
+//! the test writes into `agents/`, use the file queue under `queues/`, and are driven only
+//! through their [`curio_core::AgentHandle`]: messages go in through the queue, and the
+//! test watches observations, drains the agent and inspects the image it hands back. A
+//! second `Runtime` on the same directory plays the part of another host or a restarted
+//! process.
+//!
+//! Most agents use `builtin.model.scripted`, so the tests need no network and every reply
+//! is fixed. A scripted `delay_ms` gives a drain or a crash a window to land in during a
+//! model attempt. The OpenAI-compatible model is tested against [`fake_server`], a
+//! loopback HTTP server that plays back canned responses and records the requests.
+//!
+//! The helpers fall into three groups. [`runtime`], [`runtime_with_secrets`],
+//! [`write_agent`], [`scripted_agent`] and [`create`] set up a runtime and an agent.
+//! [`next_turn_end`] and [`wait_for`] wait on observations, failing after [`WAIT`] instead
+//! of hanging. [`drain`], [`log_events`] and [`contents`] get results out: a drain's image
+//! (asserting the drain was clean), the events in an agent's log file, and an image's
+//! history as role and text pairs.
 
 use curio_builtins::registry;
 use curio_core::{
@@ -11,8 +32,11 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+/// How long any wait in these tests may take before the test fails. Also the drain
+/// deadline, so a drain that gets forced means the agent was stuck.
 const WAIT: Duration = Duration::from_secs(10);
 
+/// A runtime-level plugin entry with no grants.
 fn spec(runner: &str, code: Value) -> RuntimePluginSpec {
     RuntimePluginSpec {
         runner: runner.into(),
@@ -21,6 +45,9 @@ fn spec(runner: &str, code: Value) -> RuntimePluginSpec {
     }
 }
 
+/// Starts a runtime on `dir` with every built-in runner enabled and `secrets` as the inline
+/// secret table (keys are `<tenant>/<name>`). Host id `test-host`; relative paths in agent
+/// code resolve against `dir`.
 async fn runtime_with_secrets(dir: &Path, secrets: Value) -> Runtime {
     let config = RuntimeConfig {
         host_id: "test-host".into(),
@@ -34,16 +61,24 @@ async fn runtime_with_secrets(dir: &Path, secrets: Value) -> Runtime {
         .unwrap()
 }
 
+/// Starts a runtime on `dir` with no secrets.
 async fn runtime(dir: &Path) -> Runtime {
     runtime_with_secrets(dir, json!({})).await
 }
 
+/// Writes an agent template to `dir/agents/<name>.yaml`, where the provisioner looks.
 fn write_agent(dir: &Path, name: &str, yaml: &str) {
     std::fs::create_dir_all(dir.join("agents")).unwrap();
     std::fs::write(dir.join("agents").join(format!("{name}.yaml")), yaml).unwrap();
 }
 
 /// A scripted agent: `replies` is the YAML list of scripted replies; `extra` adds plugins.
+///
+/// The agent always has a driver (at most 10 steps and 2 forced continuations per turn),
+/// the scripted model with `delay_ms` per reply, the file queue, the system prompt
+/// "Be brief." and the clock tool. `resume` is the YAML for the `resume` field. `replies`
+/// must be indented to sit under `replies:` (eight spaces), and `extra` must be plugin
+/// list items indented by two spaces.
 fn scripted_agent(
     id: &str,
     tenant: &str,
@@ -80,6 +115,8 @@ plugins:
     )
 }
 
+/// A script whose first turn calls the clock and then answers "It is now.", and whose
+/// second turn answers "Second answer." without tools.
 const CLOCK_THEN_ANSWER: &str = r#"
         - text: "Checking."
           tool_calls: [{ name: clock }]
@@ -87,6 +124,8 @@ const CLOCK_THEN_ANSWER: &str = r#"
         - text: "Second answer."
 "#;
 
+/// Creates and starts an agent from a template, keeping the template's id. Panics on
+/// failure.
 async fn create(rt: &Runtime, template: &str) -> RunningAgent {
     rt.create(CreateRequest {
         template: template.into(),
@@ -97,6 +136,8 @@ async fn create(rt: &Runtime, template: &str) -> RunningAgent {
     .unwrap()
 }
 
+/// Waits for the next `TurnEnded` observation and returns how the turn ended. Panics after
+/// [`WAIT`].
 async fn next_turn_end(rx: &mut broadcast::Receiver<Observation>) -> TurnEnd {
     tokio::time::timeout(WAIT, async {
         loop {
@@ -109,6 +150,8 @@ async fn next_turn_end(rx: &mut broadcast::Receiver<Observation>) -> TurnEnd {
     .expect("turn did not end")
 }
 
+/// Waits for the first observation that matches `pred`, skipping the rest. Panics after
+/// [`WAIT`].
 async fn wait_for(
     rx: &mut broadcast::Receiver<Observation>,
     pred: impl Fn(&Observation) -> bool,
@@ -125,6 +168,8 @@ async fn wait_for(
     .expect("observation did not arrive")
 }
 
+/// Drains an agent at `at`, waits for its task to exit cleanly, and returns its image.
+/// Panics if the drain failed or had to be forced.
 async fn drain(agent: RunningAgent, at: DrainPoint) -> AgentImage {
     let result = agent.handle.drain(at, WAIT).await.unwrap();
     agent.task.await.unwrap().unwrap();
@@ -137,6 +182,8 @@ async fn drain(agent: RunningAgent, at: DrainPoint) -> AgentImage {
     }
 }
 
+/// Reads an agent's events straight from its log file under `dir/logs`, skipping the
+/// header line and the per-line epoch.
 fn log_events(dir: &Path, agent: &str) -> Vec<Event> {
     let text = std::fs::read_to_string(dir.join("logs").join(agent).join("log.jsonl")).unwrap();
     text.lines()
@@ -148,6 +195,7 @@ fn log_events(dir: &Path, agent: &str) -> Vec<Event> {
         .collect()
 }
 
+/// An image's model-visible messages as role and text pairs, without the system prompt.
 fn contents(image: &AgentImage) -> Vec<(Role, String)> {
     image
         .view
@@ -158,6 +206,10 @@ fn contents(image: &AgentImage) -> Vec<(Role, String)> {
         .collect()
 }
 
+/// One message runs a whole turn: the model calls the clock, the tool result goes back to
+/// it, and its answer ends the turn as completed. The image shows the system prompt from
+/// `builtin.instructions`, the history in order (user, assistant with a call, tool result,
+/// assistant), and the instructions plugin's slot recording that its prompt is applied.
 #[tokio::test]
 async fn a_turn_runs_tools_and_answers() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,6 +244,11 @@ async fn a_turn_runs_tools_and_answers() {
     assert_eq!(instructions.blob, json!({ "applied": true }));
 }
 
+/// An agent drained between turns and thawed on a second runtime picks up exactly where it
+/// stopped. A message sent while it was quiesced waits in the queue and starts the next
+/// turn after the thaw, and the image survives a round trip through JSON. The log shows
+/// one system prompt (thaw doesn't re-run first-load work), one `Thawed` event, and two
+/// turns.
 #[tokio::test]
 async fn quiesce_then_thaw_on_another_runtime_keeps_everything() {
     let dir = tempfile::tempdir().unwrap();
@@ -252,6 +309,10 @@ async fn quiesce_then_thaw_on_another_runtime_keeps_everything() {
     );
 }
 
+/// A drain at a step boundary, requested while the first model attempt is in flight, lets
+/// that step finish and quiesces before the next one. The image has the turn open and
+/// marked suspended. After a thaw the same turn continues to its answer with no repair:
+/// the log has a single `TurnStarted` and a `Quiesced` event naming the suspended turn.
 #[tokio::test]
 async fn a_drain_at_a_step_boundary_suspends_the_turn_and_thaw_continues_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -304,6 +365,11 @@ async fn a_drain_at_a_step_boundary_suspends_the_turn_and_thaw_continues_it() {
     )));
 }
 
+/// Aborting the agent's task while a `sleep 30` shell call runs simulates a crash after
+/// `ToolStarted` was synced. Recovery on a new runtime gives the call an "outcome is
+/// unknown" result, ends the turn as interrupted, and (with `after_crash: continue`) queues
+/// a system notice that starts a new turn, which completes with the script's next reply.
+/// The log records one repaired call in its `Recovered` event.
 #[tokio::test]
 async fn a_crash_during_a_tool_is_repaired_and_the_turn_continues() {
     let dir = tempfile::tempdir().unwrap();
@@ -363,6 +429,8 @@ async fn a_crash_during_a_tool_is_repaired_and_the_turn_continues() {
     )));
 }
 
+/// When another runtime opens a running agent's log for recovery, the epoch rises and the
+/// original agent's next sync fails with `Fenced`, which stops its task with that error.
 #[tokio::test]
 async fn a_newer_owner_fences_off_the_old_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -392,6 +460,9 @@ async fn a_newer_owner_fences_off_the_old_one() {
     assert!(matches!(result, Err(Error::Fenced { .. })), "{result:?}");
 }
 
+/// An image whose log has moved on can't be thawed. The test thaws an image, runs a turn
+/// (so the log grows past the image's position), drains again, and then tries the old
+/// image, which fails with `StaleImage` instead of forking the conversation.
 #[tokio::test]
 async fn an_out_of_date_image_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -411,6 +482,9 @@ async fn an_out_of_date_image_is_refused() {
     assert!(matches!(rt.thaw(old).await, Err(Error::StaleImage { .. })));
 }
 
+/// With `builtin.approval` set to ask for `shell`, the call raises an approval request
+/// visible to observers, and a denial with a note becomes the call's model-visible result.
+/// The command never runs, and the model's next reply completes the turn.
 #[tokio::test]
 async fn approval_can_deny_a_call() {
     let dir = tempfile::tempdir().unwrap();
@@ -456,6 +530,9 @@ async fn approval_can_deny_a_call() {
     assert_eq!(contents(&image)[2].1, "The user denied this call: not now");
 }
 
+/// Two agents of different tenants, with different scripts, run turns at the same time in
+/// one runtime and share the queue directory. Each one's history holds only its own
+/// messages and replies.
 #[tokio::test]
 async fn agents_in_one_process_are_isolated() {
     let dir = tempfile::tempdir().unwrap();
@@ -496,6 +573,11 @@ async fn agents_in_one_process_are_isolated() {
 }
 
 /// Serves one canned HTTP response per connection, in order, and records each request.
+///
+/// Binds a random loopback port and returns it with the server task, which yields the raw
+/// requests (headers and body) once every response has been sent. A request counts as
+/// read once the headers and `content-length` bytes of body have arrived. Each response
+/// must close the connection, since the server accepts a new one for the next response.
 async fn fake_server(responses: Vec<String>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -533,6 +615,11 @@ async fn fake_server(responses: Vec<String>) -> (u16, tokio::task::JoinHandle<Ve
     (port, task)
 }
 
+/// The OpenAI-compatible model against a fake server: the first attempt gets a 503, which
+/// `builtin.retry` retries, and the second gets a streamed reply. The turn completes with
+/// the assembled text, usage is counted, and the second request went to
+/// `<base_url>/chat/completions` with the tenant's key as a bearer token and the configured
+/// model id in the body.
 #[tokio::test]
 async fn the_openai_compatible_model_streams_retries_and_sends_the_key() {
     let sse = [
@@ -596,6 +683,9 @@ plugins:
     assert!(requests[1].contains(r#""model":"test-model""#));
 }
 
+/// A model plugin that names an API key secret missing from its `grants.secrets` fails at
+/// creation, with an error naming the secret, even though the secret store has a value for
+/// it.
 #[tokio::test]
 async fn a_secret_that_is_not_granted_fails_at_creation() {
     let dir = tempfile::tempdir().unwrap();

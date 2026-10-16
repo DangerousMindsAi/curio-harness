@@ -1,16 +1,35 @@
 //! Session log events and the view folded from them.
 //!
+//! An [`Event`] is one entry of an agent's session log. The driver and hook listeners
+//! append events for everything that happens to the agent: messages pulled from its queue,
+//! context plugins queue, the start and end of every turn and step, model replies and
+//! failed attempts, tool calls being started, denied, approved and answered, and the
+//! lifecycle markers `Quiesced`, `Thawed` and `Recovered`.
+//!
 //! The [`View`] is everything about an agent that can be derived from its log: the
-//! model-visible history, the inbox, counters and open work. It changes only by folding
-//! events, both live (through [`crate::Journal::append`]) and during crash recovery, so a
-//! recovered agent sees exactly what the live one saw.
+//! model-visible [`History`], the [`Inbox`] of input waiting to be used, the [`Counters`]
+//! limits are checked against, and open work (the open turn and step, and tool calls with
+//! no result yet). It changes only by folding events with [`View::fold`], both live
+//! (through [`crate::Journal::append`]) and during crash recovery (through
+//! [`crate::Journal::replay`]), so a recovered agent sees exactly what the live one saw.
+//! That's also why `fold` must stay deterministic and depend on nothing but the view and
+//! the event.
+//!
+//! Input reaches the model in two stages. First it's logged into the inbox, either as a
+//! [`QueuedMessage`] pulled from the queue or as context a plugin or the runtime queued;
+//! each item gets an [`InboxItemId`] and a [`Delivery`] that says whether it waits for the
+//! next turn or the next step. Then a `TurnStarted` or `StepStarted` event admits a list
+//! of those ids, which moves the items out of the inbox and into the history. Naming the
+//! admitted ids in the event, instead of "everything waiting", keeps replay exact even if
+//! more input was logged in between.
 
 use crate::agent::DrainPoint;
 use crate::ids::{CallId, InboxItemId, PluginId, QueueMsgId, RequestId, TurnId};
 use crate::message::{AssistantMessage, ChatMessage, Role, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
-/// When a queued message or context item should be used.
+/// When a queued message or context item should be used. Decides which inbox list the
+/// item waits in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
@@ -21,35 +40,46 @@ pub enum Delivery {
     NextStep,
 }
 
-/// A message as the queue delivered it.
+/// A message as the queue delivered it. Logged whole in [`Event::MessageReceived`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueuedMessage {
+    /// The queue's id for the message; increases within one agent's queue.
     pub id: QueueMsgId,
     /// When the sender sent it. Logged for diagnosis; never used for ordering.
     pub sent_at_ms: u64,
+    /// Whether the message starts a turn or steers the running one.
     pub delivery: Delivery,
+    /// The message text, shown to the model as is.
     pub body: String,
 }
 
-/// Where an inbox item came from.
+/// Where an inbox item came from. Decides how the item is labelled for the model; see
+/// [`InboxItem::to_message`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Source {
+    /// A message pulled from the agent's queue.
     Queue(QueueMsgId),
+    /// Context a plugin queued through [`crate::HookCx::queue_context`].
     Plugin(PluginId),
+    /// A notice from the runtime itself, such as [`crate::RESTARTED_NOTICE`].
     System,
 }
 
 /// Input that is logged and waiting to be used by a turn or step.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InboxItem {
+    /// Assigned when the item is folded; what `TurnStarted` and `StepStarted` admit by.
     pub id: InboxItemId,
+    /// Who the item came from.
     pub source: Source,
+    /// The item's text, before any label is added.
     pub text: String,
 }
 
 impl InboxItem {
-    /// How this item appears in the model-visible history.
+    /// How this item appears in the model-visible history: a user message, with plugin
+    /// context and system notices labelled so the model can tell them from the user.
     pub fn to_message(&self) -> ChatMessage {
         let text = match &self.source {
             Source::Queue(_) => self.text.clone(),
@@ -60,7 +90,8 @@ impl InboxItem {
     }
 }
 
-/// How a step ended.
+/// How a step ended. Logged in [`Event::StepEnded`]; the driver maps each outcome except
+/// `ToolsRan` to a [`TurnEnd`] or to the turn-stopping check.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepOutcome {
@@ -68,30 +99,47 @@ pub enum StepOutcome {
     ToolsRan,
     /// The model answered without tool calls.
     Answered,
-    /// A plugin ended the turn.
+    /// A plugin ended the turn: a `response` listener returned `StopTurn`, or a `tool_post`
+    /// listener set `concludes_turn`.
     Concluded,
+    /// The reply hit the output token limit.
     MaxTokens,
+    /// A model attempt failed and no `request_error` listener chose to retry.
     Failed {
+        /// The last attempt's error, as text.
         error: String,
     },
+    /// The turn was cancelled during the step.
     Cancelled,
     /// The process stopped during the step; written by crash repair.
     Interrupted,
 }
 
-/// How a turn ended.
+/// How a turn ended. Logged in [`Event::TurnEnded`], except for `Suspended`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnEnd {
+    /// The model answered (or a plugin concluded the turn) and nothing asked for another
+    /// step. The only end that resets [`Counters::crash_resumes`].
     Completed,
+    /// The turn reached the driver's per-turn step limit.
     StepLimit,
+    /// Plugins kept forcing more steps after the model had answered, past the driver's
+    /// limit on forced continuations.
     ContinuationLimit,
+    /// The last reply hit the output token limit.
     MaxTokens,
+    /// A `pre_step` listener rejected the step.
     Blocked {
+        /// The listener's reason.
         reason: String,
     },
+    /// The turn was cancelled: by [`crate::Command::Cancel`], by an immediate drain, or
+    /// because a drain's deadline passed.
     Cancelled,
+    /// A model attempt failed and wasn't retried.
     Error {
+        /// The attempt's error, as text.
         message: String,
     },
     /// The process stopped during the turn; written by crash repair.
@@ -102,95 +150,152 @@ pub enum TurnEnd {
 }
 
 /// One entry of an agent's session log.
+///
+/// Events are facts about the past and are never edited. The `type` tag and field names are
+/// the log's encoding, versioned by [`crate::log::LOG_FORMAT`]. Variants that change what
+/// the model sees, or what recovery needs to know, are folded by [`View::fold`]; the rest
+/// (denials, approvals and lifecycle markers) are kept for audit and for plugins that watch
+/// them in the `replay` hook.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Sets the system prompt contributed by one plugin, replacing its earlier one.
     SystemPrompt {
+        /// The contributing plugin.
         source: PluginId,
+        /// Its system prompt text.
         text: String,
     },
     /// A message pulled from the agent's queue. Logged before the queue is acknowledged.
+    /// Messages whose id is no newer than [`Inbox::last_logged`] are never logged again.
     MessageReceived {
+        /// The message as the queue delivered it.
         message: QueuedMessage,
     },
     /// Context added by a plugin or by the runtime, waiting for a turn or step.
     ContextQueued {
+        /// Who queued it; never [`Source::Queue`] in practice.
         source: Source,
+        /// Which inbox list it waits in.
         delivery: Delivery,
+        /// The context text.
         text: String,
     },
     /// A turn started with these next-turn items as its input.
     TurnStarted {
+        /// The new turn's id, from [`View::next_turn_id`].
         turn: TurnId,
+        /// The `next_turn` items moved into the history.
         admitted: Vec<InboxItemId>,
     },
     /// A step started with these next-step items added to the history. Never repeated on retry.
     StepStarted {
+        /// The `next_step` items moved into the history.
         admitted: Vec<InboxItemId>,
     },
+    /// One model attempt failed. Counted in [`Counters::failed_attempts_this_step`]; the
+    /// step may still retry.
     AttemptFailed {
+        /// The model error, as text.
         error: String,
     },
+    /// A complete model reply. Its tool calls become pending until each has a result.
     AssistantReply {
+        /// The reply as the provider returned it (with tool calls dropped when it was cut
+        /// off by the token limit).
         reply: AssistantMessage,
     },
     /// A `tool_pre` listener denied the call; the reason is the call's model-visible result.
+    /// The `ToolResult` that carries the reason follows later, when results are committed.
     ToolDenied {
+        /// The denied call.
         call_id: CallId,
+        /// Why, as the model will see it.
         reason: String,
     },
+    /// A `tool_pre` listener asked for a human decision on a call. Logged and synced before
+    /// the question goes out.
     ApprovalRequested {
+        /// The id the answer must come back under.
         request: RequestId,
+        /// The call in question.
         call_id: CallId,
+        /// What the listener asked.
         question: String,
     },
+    /// The answer to an `ApprovalRequested`, as delivered by [`crate::Command::Answer`].
     ApprovalAnswered {
+        /// The request this answers.
         request: RequestId,
+        /// Whether the call may run.
         approved: bool,
+        /// The answerer's note, passed on to the model when the call is denied.
         note: Option<String>,
     },
     /// Written and synced before the tool body runs, so recovery can tell "may have run"
     /// from "never ran".
     ToolStarted {
+        /// The call whose body is about to run.
         call_id: CallId,
     },
+    /// The committed result of one call, after `tool_post` listeners ran. Also written for
+    /// calls that never ran, as a synthetic result.
     ToolResult {
+        /// The result as the model will see it.
         result: ToolResult,
     },
+    /// The open step ended.
     StepEnded {
+        /// How it ended.
         outcome: StepOutcome,
     },
+    /// The open turn ended. Never written for a suspended turn.
     TurnEnded {
+        /// The turn that ended.
         turn: TurnId,
+        /// How it ended; never [`TurnEnd::Suspended`].
         end: TurnEnd,
     },
+    /// The agent quiesced at a safe point and its image was taken right after this event.
     Quiesced {
+        /// The safe point it stopped at: `Step` or `Turn`.
         at: DrainPoint,
+        /// The turn left open by a drain at a step boundary, if any.
         suspended_turn: Option<TurnId>,
+        /// Whether the drain deadline passed and the turn was cut short.
         forced: bool,
     },
+    /// An image was thawed and this host took over the log.
     Thawed {
+        /// The thawing host's id.
         host: String,
+        /// The epoch this host opened the log with.
         epoch: u64,
     },
+    /// The agent was rebuilt from its log after it stopped without quiescing.
     Recovered {
+        /// The recovering host's id.
         host: String,
+        /// The epoch this host opened the log with.
         epoch: u64,
+        /// How many dangling tool calls crash repair answered.
         repaired_calls: usize,
     },
 }
 
-/// The model-visible conversation.
+/// The model-visible conversation. Built only by [`View::fold`], so it can always be
+/// rebuilt from the log.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct History {
     /// System prompt parts, one per contributing plugin, in first-contribution order.
     pub system: Vec<(PluginId, String)>,
+    /// Every admitted input, reply and tool result, in log order.
     pub messages: Vec<ChatMessage>,
 }
 
 impl History {
-    /// The messages a model request is built from: one system message, then the conversation.
+    /// The messages a model request is built from: one system message joining every part
+    /// with a blank line (omitted when there are none), then the conversation.
     pub fn to_request_messages(&self) -> Vec<ChatMessage> {
         let mut out = Vec::with_capacity(self.messages.len() + 1);
         if !self.system.is_empty() {
@@ -208,16 +313,25 @@ impl History {
 }
 
 /// Logged input not yet used by a turn or step.
+///
+/// Both lists keep log order. The driver starts a turn only when `next_turn` has items, and
+/// starts another step after the model answers only when `next_step` has items, so
+/// continuing a turn is always a matter of logged data.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Inbox {
+    /// Items waiting to start the next turn. The default driver admits all of them in the
+    /// turn's `TurnStarted`.
     pub next_turn: Vec<InboxItem>,
+    /// Items waiting for the next step, of this turn or the next; admitted by `StepStarted`.
     pub next_step: Vec<InboxItem>,
     /// The newest queue message in the log; redelivered messages up to it are skipped.
     pub last_logged: Option<QueueMsgId>,
+    /// The last [`InboxItemId`] handed out; ids are never reused.
     next_item: u64,
 }
 
 impl Inbox {
+    /// Gives a new item the next id and adds it to the list `delivery` names.
     fn push(&mut self, source: Source, delivery: Delivery, text: String) {
         self.next_item += 1;
         let item = InboxItem {
@@ -231,6 +345,8 @@ impl Inbox {
         }
     }
 
+    /// Removes and returns the items of `list` whose ids are in `ids`, keeping the order of
+    /// both the taken and the remaining items. Ids not in the list are ignored.
     fn take(list: &mut Vec<InboxItem>, ids: &[InboxItemId]) -> Vec<InboxItem> {
         let (taken, kept) = std::mem::take(list)
             .into_iter()
@@ -240,40 +356,65 @@ impl Inbox {
     }
 }
 
-/// Counters derived from the log.
+/// Counters derived from the log. The driver checks its limits against these, so the limits
+/// hold across quiesce, thaw and recovery.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Counters {
+    /// Turns started over the agent's life.
     pub turns: u64,
+    /// Steps started over the agent's life.
     pub steps: u64,
+    /// Steps started in the current turn; reset by `TurnStarted`.
     pub steps_this_turn: u32,
     /// Steps this turn that started after the model had already answered.
     pub forced_this_turn: u32,
+    /// Failed model attempts in the current step; reset by `StepStarted`.
     pub failed_attempts_this_step: u32,
     /// Turns interrupted by a crash in a row; reset when a turn completes.
     pub crash_resumes: u32,
+    /// Prompt tokens over the agent's life, as providers reported them.
     pub prompt_tokens: u64,
+    /// Completion tokens over the agent's life, as providers reported them.
     pub completion_tokens: u64,
 }
 
-/// A tool call the model made that has no committed result yet.
+/// A tool call the model made that has no committed result yet. After a crash, crash
+/// repair writes a result for each one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingCall {
+    /// The call as the model made it.
     pub call: ToolCall,
+    /// Whether its `ToolStarted` was logged, meaning the body may have run.
     pub started: bool,
 }
 
 /// Everything about an agent that is derived from its log.
+///
+/// Owned by the agent's [`crate::Journal`] while it runs, and carried whole in an image.
+/// The fields are public for reading; changing them directly would make the view disagree
+/// with the log, so only [`View::fold`] should.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct View {
+    /// What the next model request is built from.
     pub history: History,
+    /// Logged input waiting for a turn or step.
     pub inbox: Inbox,
+    /// Counts the driver's limits are checked against.
     pub counters: Counters,
+    /// The turn that has started and not ended, if any. Still set for a suspended turn.
     pub open_turn: Option<TurnId>,
+    /// Whether a step has started and not ended.
     pub open_step: bool,
+    /// Tool calls from the replies so far without a committed result, in model order.
     pub pending_calls: Vec<PendingCall>,
     /// The open turn was suspended by a drain at a step boundary and can continue as is.
+    /// Set by `Quiesced`, kept through `Thawed` and `Recovered`, and cleared by any other
+    /// event, since that means the agent has moved on.
     pub suspended: bool,
+    /// The highest turn id started so far.
     last_turn: u64,
+    /// Whether the last step that ended was answered or concluded. Lets `StepStarted` tell
+    /// a forced continuation from a step the model was owed.
     last_step_answered: bool,
 }
 
@@ -284,6 +425,9 @@ impl View {
     }
 
     /// Applies one event. Deterministic, so live state and replayed state agree.
+    ///
+    /// Never fails: an event that names something the view doesn't have (an unknown call
+    /// id, an inbox id already taken) changes nothing for that part.
     pub fn fold(&mut self, event: &Event) {
         if !matches!(
             event,

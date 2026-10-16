@@ -1,7 +1,30 @@
-//! `builtin.model.scripted`: a model provider that plays back a fixed list of replies.
-//! For tests and offline demos. The reply it gives is chosen by how many assistant
-//! messages the request already holds, so it needs no state and behaves the same after
-//! thaw or recovery.
+//! `builtin.model.scripted`: a model provider that plays back a fixed list of replies,
+//! for tests and offline demos.
+//!
+//! It's a per-agent plugin that implements [`ModelProvider`] and subscribes to no hooks.
+//! The driver names it in its `model` field like any other provider.
+//!
+//! The reply it gives is chosen by how many assistant messages the request already holds:
+//! the first request of the agent's life gets reply 1, the request after that reply gets
+//! reply 2, and so on across every turn. Because that count comes from the history, which
+//! is a projection of the log, the plugin needs no state and picks the same reply after a
+//! thaw or a crash recovery. A failed attempt adds no assistant message, so a retry gets
+//! the same reply again. Once the script runs out, every request fails with a fatal error,
+//! which ends the turn with [`curio_core::TurnEnd::Error`].
+//!
+//! ```yaml
+//! - id: model
+//!   runner: builtin.model.scripted
+//!   code:
+//!     delay_ms: 300                       # optional; gives cancels and drains a window
+//!     replies:
+//!       - text: "Checking."
+//!         tool_calls: [{ name: clock }]   # arguments default to {}
+//!       - text: "It is now."
+//! ```
+//!
+//! Call ids are `call-<reply>-<call>`, both counted from 0, so they're unique within one
+//! agent's script and stable across restarts.
 
 use async_trait::async_trait;
 use curio_core::{
@@ -14,31 +37,44 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Loads [`ScriptedModel`].
+/// Loads [`ScriptedModel`]. Holds nothing itself.
 pub struct ScriptedModelRunner;
 
+/// The scripted model's code.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScriptCode {
+    /// The replies, in the order the agent receives them over its whole life. Required; an
+    /// empty list is allowed and makes every request fail.
     replies: Vec<ScriptedReply>,
-    /// How long each reply takes, to give drains and cancels something to interrupt.
+    /// How long each reply takes, in milliseconds, to give drains and cancels something to
+    /// interrupt. Defaults to 0.
     #[serde(default)]
     delay_ms: u64,
 }
 
+/// One scripted assistant reply.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScriptedReply {
+    /// The reply's text. Defaults to empty, which suits a reply that only calls tools.
     #[serde(default)]
     text: String,
+    /// Tool calls the reply makes. Defaults to none; a reply without calls ends the step
+    /// with an answer.
     #[serde(default)]
     tool_calls: Vec<ScriptedCall>,
 }
 
+/// One scripted tool call.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScriptedCall {
+    /// The tool's name. Not checked at load: a name no plugin provides reaches the driver,
+    /// which answers it with an "unknown tool" result.
     name: String,
+    /// The arguments, as a YAML value that's sent to the tool as JSON text. Defaults to
+    /// null, which becomes `{}`.
     #[serde(default)]
     arguments: Value,
 }
@@ -55,8 +91,9 @@ impl Runner for ScriptedModelRunner {
     }
 }
 
-/// Plays back scripted replies.
+/// One agent's scripted model. Immutable; the reply index is derived from each request.
 pub struct ScriptedModel {
+    /// The parsed script.
     code: ScriptCode,
 }
 
@@ -68,6 +105,12 @@ impl Plugin for ScriptedModel {
 
 #[async_trait]
 impl ModelProvider for ScriptedModel {
+    /// Picks the reply by counting assistant messages in the request, waits `delay_ms`,
+    /// then returns it whole after emitting its text as one delta.
+    ///
+    /// The finish reason is `tool_calls` when the reply has calls and `stop` otherwise; no
+    /// usage is reported. Returns a `Cancelled` error as soon as `cancel` fires during the
+    /// delay, and a `Fatal` one when the script has no reply at this index.
     async fn complete(
         &self,
         request: ModelRequest,

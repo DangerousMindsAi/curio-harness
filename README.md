@@ -37,6 +37,8 @@ API keys live only in the host file's secret store, as `<tenant>/<name>`. An age
 
 ## Layout
 
+Every folder has a README describing what is in it and how it connects to the rest; [crates/README.md](crates/README.md) is the place to start for the code, and each source file opens with a description of its contents.
+
 | Crate | Contents |
 |---|---|
 | [curio-core](crates/curio-core) | The agent context, plugin and runner interfaces, hooks, session log, agent image and the runtime (create, thaw, recover). |

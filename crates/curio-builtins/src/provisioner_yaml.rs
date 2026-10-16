@@ -1,5 +1,22 @@
-//! `builtin.provisioner.yaml-dir`: creates agents from YAML files in a directory. The
-//! template name is the file name without `.yaml`.
+//! `builtin.provisioner.yaml-dir`: creates agents from YAML files in a directory.
+//!
+//! This is a runtime-level plugin. The host's startup file names it as the `provisioner`,
+//! and it implements [`Provisioner`] with no hooks and no state. [`curio_core::Runtime::create`]
+//! calls it once per new agent; after that the agent's configuration lives in its log
+//! header and its images, so thaw and recovery never ask the provisioner again, and editing
+//! a template file changes only agents created afterwards.
+//!
+//! A [`CreateRequest`]'s template name picks the file `<dir>/<template>.yaml`, which holds
+//! one [`AgentConfig`] (the same format as `examples/agents/assistant.yaml`). When the
+//! request carries an agent id, it replaces the file's `id`, which is how one template
+//! backs several agents. The request's `params` are ignored, and the spec it returns has no
+//! initial state or events.
+//!
+//! ```yaml
+//! provisioner:
+//!   runner: builtin.provisioner.yaml-dir
+//!   code: { dir: examples/agents }   # relative to the startup file's directory
+//! ```
 
 use crate::fsutil::path_component;
 use async_trait::async_trait;
@@ -12,12 +29,15 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Loads [`YamlDirProvisioner`].
+/// Loads [`YamlDirProvisioner`]. Holds nothing itself.
 pub struct YamlDirProvisionerRunner;
 
+/// The provisioner's code.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvisionerCode {
+    /// The template directory. Required; relative paths resolve against the startup file's
+    /// directory.
     dir: PathBuf,
 }
 
@@ -27,6 +47,8 @@ impl Runner for YamlDirProvisionerRunner {
         "builtin.provisioner.yaml-dir"
     }
 
+    /// Fails unless `dir` exists and is a directory. Templates aren't read or checked
+    /// until an agent is created from them.
     async fn load(&self, code: &Value, env: &LoadEnv) -> Result<LoadedPlugin> {
         let code: ProvisionerCode = env.parse_code(code)?;
         let dir = env.resolve_path(&code.dir);
@@ -46,8 +68,9 @@ impl Runner for YamlDirProvisionerRunner {
     }
 }
 
-/// Reads agent configurations from `<dir>/<template>.yaml`.
+/// Reads agent configurations from `<dir>/<template>.yaml`, fresh on every request.
 pub struct YamlDirProvisioner {
+    /// The resolved template directory.
     dir: PathBuf,
 }
 
@@ -58,12 +81,22 @@ impl Plugin for YamlDirProvisioner {
 }
 
 /// Parses an agent configuration from YAML.
+///
+/// [`AgentConfig`] denies unknown fields, so a misspelled key fails here with serde's
+/// message. It's public so a host can parse agent files the same way. It checks only the
+/// format: runner names, code tables and grants are checked later, when the
+/// runtime loads each plugin.
 pub fn parse_agent_yaml(text: &str) -> Result<AgentConfig> {
     serde_yaml_ng::from_str(text).map_err(Error::config)
 }
 
 #[async_trait]
 impl Provisioner for YamlDirProvisioner {
+    /// Reads and parses the template, applying the requested agent id if there is one.
+    ///
+    /// Fails with a configuration error when the template name isn't a single path
+    /// component, the file can't be read, or it doesn't parse. The file's own `id` is
+    /// still required even when the request overrides it.
     async fn provision(&self, request: CreateRequest) -> Result<AgentSpec> {
         let path = self
             .dir

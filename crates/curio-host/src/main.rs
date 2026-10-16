@@ -1,5 +1,24 @@
-//! `curio`: a local curio-harness host. Reads a host YAML file (the runtime's startup
-//! file), creates, thaws or recovers one agent, and lets you talk to it in the terminal.
+//! `curio`, the local curio-harness host.
+//!
+//! A host is the process that owns a [`curio_core::Runtime`] and decides which agents run
+//! in it. In production that would be a server taking orders from an orchestrator; this
+//! one is a command-line program for one person on one machine. It reads the host YAML
+//! file (the runtime's startup file in the proposal's terms), starts a runtime with every
+//! built-in runner from [`curio_builtins::registry`], brings one agent to life and hands
+//! it to [`repl`] so you can talk to it in the terminal.
+//!
+//! Bringing an agent to life uses whichever of the runtime's three entry points fits what
+//! is on disk, checked in this order by [`load_agent`]:
+//!
+//! 1. A saved image in `images_dir` means the agent was quiesced cleanly last time, so it
+//!    is thawed ([`curio_core::Runtime::thaw`]) and continues exactly where it stopped.
+//! 2. A session log without an image means the process stopped without quiescing (a crash,
+//!    a kill, or `/kill`), so it is recovered from the log ([`curio_core::Runtime::recover`]).
+//! 3. Neither means the agent is new, so the provisioner creates it from its template
+//!    ([`curio_core::Runtime::create`]).
+//!
+//! Relative paths in the host file and in agent files resolve against the directory that
+//! holds the host file, so the program behaves the same from any working directory.
 
 mod repl;
 
@@ -12,6 +31,7 @@ use curio_core::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Command-line arguments.
 #[derive(Parser)]
 #[command(name = "curio", about = "Run curio-harness agents on this machine")]
 struct Cli {
@@ -22,6 +42,8 @@ struct Cli {
     command: Command,
 }
 
+/// What to do once the runtime is up. There is one subcommand for now; more (listing
+/// agents, sending a message without a terminal session) would go here.
 #[derive(Subcommand)]
 enum Command {
     /// Talk to an agent. Creates it from `<template>.yaml` in the provisioner's directory the
@@ -35,19 +57,30 @@ enum Command {
     },
 }
 
-/// The host's startup file: the runtime configuration plus where images are kept.
+/// The host's startup file, as read from YAML. Everything except `images_dir` is passed
+/// straight to the runtime as a [`RuntimeConfig`]; `images_dir` belongs to the host
+/// because what happens to an image after a drain is outside the harness. Unknown keys
+/// are rejected so a typo fails at start instead of being ignored.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostConfig {
+    /// Names this host in the `Thawed` and `Recovered` events it writes to agent logs.
     host_id: String,
-    /// Where `/quit` saves agent images and where the next start looks for them.
+    /// Where `/quit` and `/pause` save agent images and where the next start looks for them.
     images_dir: PathBuf,
+    /// Runner names agents may use; see [`RuntimeConfig::runners`].
     runners: Vec<String>,
+    /// The runtime-level plugin that keeps every agent's session log.
     log_store: RuntimePluginSpec,
+    /// The runtime-level plugin that produces a new agent's configuration from a template.
     provisioner: RuntimePluginSpec,
+    /// The runtime-level plugin that resolves secret names, such as API keys.
     secret_store: RuntimePluginSpec,
 }
 
+/// Reads the host file, starts the runtime and runs the subcommand. Any configuration
+/// problem (an unreadable file, an unknown key, a runner that fails to load) ends the
+/// program here with a message, before an agent is touched.
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -82,8 +115,16 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Thaws the agent from its image if one was saved, recovers it from its log if it has
-/// one, and creates it otherwise.
+/// Starts agent `id`: thaws it from its saved image if there is one, recovers it from its
+/// log if it has one, and otherwise creates it from `template`. Prints one line saying
+/// which happened.
+///
+/// After a successful thaw the image file is deleted: the thaw appended a `Thawed` event,
+/// so the log has moved past the image and the runtime would refuse it next time anyway.
+/// A stale image (the log moved on while the image sat on disk) is deleted too, and the
+/// agent is recovered from its log instead. Any other thaw failure, such as a plugin that
+/// no longer loads, keeps the image so that fixing the configuration and starting again
+/// still resumes from it.
 async fn load_agent(
     runtime: &Runtime,
     images_dir: &Path,
@@ -101,15 +142,14 @@ async fn load_agent(
                 image.config.id
             );
         }
-        let result = runtime.thaw(image).await;
-        // The log has moved past the image now (or already had), so it can never be thawed again.
-        std::fs::remove_file(&image_path)?;
-        return match result {
+        return match runtime.thaw(image).await {
             Ok(agent) => {
+                std::fs::remove_file(&image_path)?;
                 println!("Resumed `{id}` from its saved image.");
                 Ok(agent)
             }
             Err(Error::StaleImage { .. }) => {
+                std::fs::remove_file(&image_path)?;
                 println!(
                     "The saved image of `{id}` is out of date; recovering from its log instead."
                 );
@@ -133,11 +173,14 @@ async fn load_agent(
     Ok(agent)
 }
 
+/// Where the image of agent `id` is saved: `<images_dir>/<id>.json`.
 fn image_path(images_dir: &Path, id: &AgentId) -> PathBuf {
     images_dir.join(format!("{id}.json"))
 }
 
-/// Writes an image so that a crash mid-write never leaves a torn file behind.
+/// Saves an image as pretty-printed JSON and returns its path. Writes a temporary file and
+/// renames it into place, so a crash mid-write leaves either the old image or the new one,
+/// never a torn file that the next start would fail to read.
 fn save_image(images_dir: &Path, image: &AgentImage) -> Result<PathBuf> {
     std::fs::create_dir_all(images_dir)?;
     let path = image_path(images_dir, &image.config.id);

@@ -1,4 +1,22 @@
 //! The terminal conversation with one agent.
+//!
+//! [`run`] is a small event loop over four sources at once: lines you type, the agent's
+//! live [`Observation`]s, Ctrl-C, and the agent's task finishing on its own (which only
+//! happens when something went wrong, such as the log being fenced by another host).
+//! The REPL never touches the agent's state. It talks to the agent the same way any host
+//! would, through its [`curio_core::AgentHandle`]: typed text is published to the agent's
+//! message queue, and `/cancel`, approval answers and drains are commands.
+//!
+//! What you type is delivered in one of two ways. When the agent is idle, a line becomes
+//! a [`Delivery::NextTurn`] message and starts a turn. While a turn is running, a line
+//! becomes a [`Delivery::NextStep`] message, which the driver picks up at its next step
+//! boundary, so you can steer the agent mid-turn without cancelling it.
+//!
+//! Leaving is a drain. `/quit` (or Ctrl-D, or Ctrl-C while idle) drains at the turn
+//! boundary and `/pause` at the next step boundary; either way the REPL keeps printing
+//! the agent's output until it reaches that safe point, then saves the image it hands
+//! back with [`crate::save_image`]. `/kill` skips all of that and exits the process, which
+//! leaves the log as a crash would and exercises recovery on the next start.
 
 use crate::save_image;
 use anyhow::Result;
@@ -11,11 +29,13 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 
+// ANSI escape codes for the little styling the REPL uses.
 const DIM: &str = "\x1b[2m";
 const CYAN: &str = "\x1b[36m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// The `/help` text, which is also the list of commands [`run`] understands.
 const HELP: &str = "Type a message and press Enter. While the agent is working, what you type is added to its next step.
   /quit    finish the current turn, save the agent and exit (Ctrl-D does the same)
   /pause   stop at the next step boundary, save the agent mid-turn and exit
@@ -23,14 +43,19 @@ const HELP: &str = "Type a message and press Enter. While the agent is working, 
   /kill    exit at once without saving, as a crash would; the next start recovers from the log
   /help    show this";
 
-/// How long `/quit` and `/pause` wait before forcing the agent to stop.
+/// How long `/quit` and `/pause` wait for the safe point. After this the agent cancels
+/// the running turn and quiesces anyway, and the save message says the stop was forced.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Prints the input prompt. Shown only while the agent is idle, so a prompt on screen
+/// means "type a new message".
 fn prompt() {
     print!("{CYAN}> {RESET}");
     let _ = std::io::stdout().flush();
 }
 
+/// Squeezes text onto one line and cuts it to `max` characters, for showing tool
+/// arguments and results without flooding the terminal. The agent always sees the full text.
 fn short(text: &str, max: usize) -> String {
     let one_line = text.replace('\n', " ⏎ ");
     if one_line.chars().count() <= max {
@@ -40,15 +65,20 @@ fn short(text: &str, max: usize) -> String {
     }
 }
 
-/// What the terminal shows and expects next.
+/// The REPL's view of the conversation: what the terminal is showing and what kind of
+/// input it expects next.
 #[derive(Default)]
 struct Screen {
+    /// A turn is running, so typed text is steering and Ctrl-C cancels.
     busy: bool,
+    /// The agent asked to approve a tool call; the next typed line answers it.
     approval: Option<RequestId>,
+    /// The cursor is in the middle of streamed text, so the next block needs a newline first.
     mid_line: bool,
 }
 
 impl Screen {
+    /// Ends the current line if streamed text left the cursor mid-line.
     fn line_break(&mut self) {
         if self.mid_line {
             println!();
@@ -56,6 +86,10 @@ impl Screen {
         }
     }
 
+    /// Prints one observation and updates the screen state from it. Model text streams
+    /// inline as it arrives, reasoning is dimmed, tool calls and results get one short
+    /// line each, and an approval request prints a question and arms [`Screen::approval`].
+    /// A turn's end clears the busy flag and shows the prompt again.
     fn show(&mut self, observation: Observation) {
         match observation {
             Observation::TurnStarted { .. } => self.busy = true,
@@ -108,7 +142,12 @@ impl Screen {
     }
 }
 
-/// Runs the conversation until the user quits or the agent stops.
+/// Runs the conversation with `agent` until you leave, then drains it and saves its image
+/// to `images_dir`.
+///
+/// Returns early without saving when the agent's task stops by itself; the reason is
+/// printed, and the next start recovers the agent from its log. A drain that fails (the
+/// agent hit an error before reaching the safe point) is reported the same way.
 pub async fn run(mut agent: RunningAgent, images_dir: &Path) -> Result<()> {
     let handle = agent.handle.clone();
     let mut observations = handle.subscribe();
@@ -125,6 +164,8 @@ pub async fn run(mut agent: RunningAgent, images_dir: &Path) -> Result<()> {
             line = lines.next_line() => {
                 let Some(line) = line? else { break DrainPoint::Turn };
                 let line = line.trim().to_string();
+                // While an approval is pending, the line is its answer: "y" approves, an
+                // empty line or "n" refuses, and anything else refuses with that reason.
                 if let Some(request) = screen.approval.take() {
                     let approve = matches!(line.to_lowercase().as_str(), "y" | "yes");
                     let note = (!approve && !matches!(line.to_lowercase().as_str(), "" | "n" | "no")).then_some(line);
