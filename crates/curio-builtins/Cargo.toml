@@ -1,0 +1,24 @@
+[package]
+name = "curio-builtins"
+description = "Built-in runners for curio-harness: driver, model, queue, log store, provisioner, tools and policies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+curio-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+humantime.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

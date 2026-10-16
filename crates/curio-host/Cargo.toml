@@ -1,0 +1,20 @@
+[package]
+name = "curio-host"
+description = "A local curio-harness host: runs agents from YAML configs and lets you talk to them in the terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "curio"
+path = "src/main.rs"
+
+[dependencies]
+curio-core.workspace = true
+curio-builtins.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true

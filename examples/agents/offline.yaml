@@ -1,0 +1,33 @@
+# An agent with a scripted model, for trying the host (save, resume, crash recovery)
+# without an API key. It calls the clock tool, then gives fixed answers.
+id: offline
+tenant: local
+resume: { after_crash: continue, max_resumes: 2 }
+
+plugins:
+  - id: driver
+    runner: builtin.driver.react
+    code: { model: model, max_steps_per_turn: 10, max_forced_continuations: 1 }
+
+  - id: model
+    runner: builtin.model.scripted
+    code:
+      delay_ms: 1500
+      replies:
+        - text: "Let me look at the clock."
+          tool_calls: [{ name: clock }]
+        - text: "Done: the time is in the tool result above."
+        - text: "This is my second answer. Try /quit, then start me again."
+        - text: "I am back where we left off."
+        - text: "That was the last scripted reply."
+
+  - id: queue
+    runner: builtin.queue.file
+    code: { dir: data/queues }
+
+  - id: instructions
+    runner: builtin.instructions
+    code: { text: "You are a scripted test agent." }
+
+  - id: clock
+    runner: builtin.tool.clock

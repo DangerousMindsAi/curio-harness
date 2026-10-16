@@ -2,7 +2,7 @@
 
 *A plugin-first agent loop for curio-harness, with checkpoint, resume and graceful quiesce, for many isolated agents in one process.*
 
-Status: proposal for discussion. Nothing here is implemented.
+Status: accepted. A first implementation is in `crates/`; the [README](../../README.md#status-against-the-proposal) lists where it differs.
 
 This builds on the [architecture survey](../harness-survey/README.md), the [agent loop docs](../agent-loops/README.md) and the [crash recovery doc](../crash-recovery/README.md). Where an idea comes from one of the three surveyed harnesses, the text says which.
 

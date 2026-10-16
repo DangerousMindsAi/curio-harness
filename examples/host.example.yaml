@@ -1,0 +1,29 @@
+# The local host's startup file. Copy it to host.yaml at the repository root (host.yaml is
+# gitignored, so your key stays out of git), then put your DeepInfra key below.
+# Relative paths here and in agent files resolve against the directory of this file's copy.
+
+host_id: local
+
+# Where /quit saves agent images, and where the next start looks for them.
+images_dir: data/images
+
+# Runners agents may use. `builtin.*` enables every built-in runner.
+runners: ["builtin.*"]
+
+# Runtime-level plugins: one each per process, shared by every agent.
+log_store:
+  runner: builtin.logstore.file
+  code: { dir: data/logs }
+
+provisioner:
+  runner: builtin.provisioner.yaml-dir
+  code: { dir: examples/agents }   # `curio chat assistant` reads examples/agents/assistant.yaml
+
+secret_store:
+  runner: builtin.secrets.inline
+  code:
+    secrets:
+      # Keys are <tenant>/<name>. Agents ask for a name and get their own tenant's value.
+      local/deepinfra: "YOUR_DEEPINFRA_API_KEY"
+      # Or read the value from an environment variable instead:
+      # local/deepinfra: { env: DEEPINFRA_API_KEY }
